@@ -1,0 +1,639 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Carpool</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/gun/gun.js"></script>
+  </head>
+  <body class="bg-white">
+    <div id="root"></div>
+    <script type="text/babel" data-presets="react">
+      const { useEffect, useRef, useState } = React;
+
+      const PEERS = ['https://gun-manhattan.herokuapp.com/gun', 'https://peer.wallie.io/gun'];
+      const gun = Gun({ peers: PEERS });
+      const ROOT = 'carpool-v1';
+
+      const uid = (n = 10) => Math.random().toString(36).slice(2, 2 + n);
+
+      const parse = (s) => {
+        if (s == null || s === '') return null;
+        if (typeof s !== 'string') return s;
+        try {
+          return JSON.parse(s);
+        } catch {
+          return null;
+        }
+      };
+
+      const fmt = (t) => {
+        const d = new Date(t);
+        return isNaN(d) ? t || '' : d.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+      };
+
+      const clampSeats = (v) => Math.min(8, Math.max(1, parseInt(v, 10) || 1));
+
+      const hav = (a, b) => {
+        const R = 6371;
+        const r = (x) => (x * Math.PI) / 180;
+        const dLat = r(b.lat - a.lat);
+        const dLon = r(b.lon - a.lon);
+        const h =
+          Math.sin(dLat / 2) ** 2 +
+          Math.cos(r(a.lat)) * Math.cos(r(b.lat)) * Math.sin(dLon / 2) ** 2;
+        return 2 * R * Math.asin(Math.sqrt(h));
+      };
+
+      const getMatrix = async (pts) => {
+        const fallback = (i, k) => (hav(pts[i], pts[k]) / 40) * 3600;
+        try {
+          const coords = pts.map((p) => `${p.lon},${p.lat}`).join(';');
+          const r = await fetch(
+            `https://router.project-osrm.org/table/v1/driving/${coords}?annotations=duration`
+          );
+          const j = await r.json();
+          if (j.code !== 'Ok') throw new Error('osrm');
+          return pts.map((_, i) => pts.map((_, k) => j.durations[i][k] ?? fallback(i, k)));
+        } catch {
+          return pts.map((_, i) => pts.map((_, k) => fallback(i, k)));
+        }
+      };
+
+      const inp =
+        'w-full border-2 border-black bg-white px-3 py-2 text-sm outline-none focus:bg-neutral-100';
+      const btn =
+        'border-2 border-black px-3 py-2 text-xs font-bold uppercase tracking-wider hover:bg-black hover:text-white';
+
+      function Field({ value, onCommit, ...rest }) {
+        const [v, setV] = useState(value ?? '');
+        const focused = useRef(false);
+        useEffect(() => {
+          if (!focused.current) setV(value ?? '');
+        }, [value]);
+        return (
+          <input
+            {...rest}
+            value={v}
+            className={inp}
+            onFocus={() => (focused.current = true)}
+            onChange={(e) => setV(e.target.value)}
+            onBlur={() => {
+              focused.current = false;
+              if (String(v) !== String(value ?? '')) onCommit(v);
+            }}
+          />
+        );
+      }
+
+      function AddressInput({ value, onChange, placeholder }) {
+        const label = value?.label ?? '';
+        const [q, setQ] = useState(label);
+        const [items, setItems] = useState([]);
+        const [open, setOpen] = useState(false);
+        const focused = useRef(false);
+        const labelRef = useRef(label);
+        const timer = useRef(null);
+        const ctrl = useRef(null);
+        labelRef.current = label;
+
+        useEffect(() => {
+          if (!focused.current) setQ(label);
+        }, [label]);
+
+        useEffect(
+          () => () => {
+            clearTimeout(timer.current);
+            ctrl.current?.abort();
+          },
+          []
+        );
+
+        const search = (text) => {
+          setQ(text);
+          clearTimeout(timer.current);
+          if (text.trim().length < 3) {
+            setItems([]);
+            setOpen(false);
+            return;
+          }
+          timer.current = setTimeout(async () => {
+            ctrl.current?.abort();
+            const c = new AbortController();
+            ctrl.current = c;
+            try {
+              const r = await fetch(
+                `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=5&q=${encodeURIComponent(text)}`,
+                { signal: c.signal }
+              );
+              const data = await r.json();
+              setItems(
+                data.map((x) => ({
+                  label: x.display_name.split(',').slice(0, 3).join(',').trim(),
+                  lat: parseFloat(x.lat),
+                  lon: parseFloat(x.lon),
+                }))
+              );
+              setOpen(true);
+            } catch (e) {
+              if (e.name !== 'AbortError') setItems([]);
+            }
+          }, 400);
+        };
+
+        const pick = (it) => {
+          setQ(it.label);
+          setItems([]);
+          setOpen(false);
+          onChange(it);
+        };
+
+        return (
+          <div className="relative">
+            <input
+              value={q}
+              placeholder={placeholder}
+              className={inp}
+              onChange={(e) => search(e.target.value)}
+              onFocus={() => {
+                focused.current = true;
+                if (items.length) setOpen(true);
+              }}
+              onBlur={() => {
+                focused.current = false;
+                setTimeout(() => {
+                  setOpen(false);
+                  setQ(labelRef.current);
+                }, 150);
+              }}
+            />
+            {open && items.length > 0 && (
+              <ul className="absolute z-20 mt-1 w-full border-2 border-black bg-white">
+                {items.map((it, k) => (
+                  <li key={k}>
+                    <button
+                      type="button"
+                      onMouseDown={(e) => {
+                        e.preventDefault();
+                        pick(it);
+                      }}
+                      className="block w-full px-3 py-2 text-left text-xs hover:bg-black hover:text-white"
+                    >
+                      {it.label}
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        );
+      }
+
+      function EventForm({ initial, submitLabel, onSave, onCancel }) {
+        const [name, setName] = useState(initial?.name ?? '');
+        const [dest, setDest] = useState(initial?.dest ?? null);
+        const [time, setTime] = useState(initial?.time ?? '');
+        const [err, setErr] = useState('');
+
+        const submit = () => {
+          if (!name.trim()) return setErr('Name the match.');
+          if (!dest) return setErr('Pick a destination from the list.');
+          if (!time) return setErr('Set date and time.');
+          setErr('');
+          onSave({ name: name.trim(), dest, time });
+        };
+
+        return (
+          <div className="space-y-3 border-2 border-black p-4">
+            <label className="block text-xs font-bold uppercase tracking-wider">Match name</label>
+            <input
+              className={inp}
+              placeholder="Home vs Away"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+            />
+            <label className="block text-xs font-bold uppercase tracking-wider">Destination</label>
+            <AddressInput value={dest} onChange={setDest} placeholder="Stadium or address" />
+            <label className="block text-xs font-bold uppercase tracking-wider">Date and time</label>
+            <input
+              type="datetime-local"
+              className={inp}
+              value={time}
+              onChange={(e) => setTime(e.target.value)}
+            />
+            {err && <p className="text-sm font-bold">{err}</p>}
+            <div className="flex gap-2">
+              <button onClick={submit} className="flex-1 bg-black py-3 text-xs font-black uppercase tracking-widest text-white">
+                {submitLabel}
+              </button>
+              {onCancel && (
+                <button onClick={onCancel} className={btn}>
+                  Cancel
+                </button>
+              )}
+            </div>
+          </div>
+        );
+      }
+
+      function DriverRow({ d, onPatch, onRemove }) {
+        return (
+          <div className="space-y-2 border-2 border-black p-3">
+            <Field placeholder="Name" value={d.name} onCommit={(name) => onPatch({ name })} />
+            <AddressInput value={d.addr} placeholder="Origin address" onChange={(addr) => onPatch({ addr })} />
+            <div className="flex items-center gap-2">
+              <Field
+                type="number"
+                min="1"
+                max="8"
+                placeholder="Seats"
+                value={d.seats}
+                onCommit={(v) => onPatch({ seats: clampSeats(v) })}
+              />
+              <button className={btn} onClick={onRemove}>×</button>
+            </div>
+          </div>
+        );
+      }
+
+      function PassengerRow({ p, onPatch, onRemove }) {
+        return (
+          <div className="space-y-2 border-2 border-black p-3">
+            <Field placeholder="Name" value={p.name} onCommit={(name) => onPatch({ name })} />
+            <AddressInput value={p.addr} placeholder="Pickup address" onChange={(addr) => onPatch({ addr })} />
+            <button className={btn} onClick={onRemove}>Remove</button>
+          </div>
+        );
+      }
+
+      function readCache(eid) {
+        try {
+          return JSON.parse(localStorage.getItem(`carpool:${eid}`)) || null;
+        } catch {
+          return null;
+        }
+      }
+
+      function App() {
+        const initEid = new URLSearchParams(location.search).get('event') || '';
+        const [cached] = useState(() => (initEid ? readCache(initEid) : null));
+        const [eid, setEid] = useState(initEid);
+        const [meta, setMeta] = useState(cached?.meta ?? null);
+        const [drivers, setDrivers] = useState(cached?.drivers ?? {});
+        const [passengers, setPassengers] = useState(cached?.passengers ?? {});
+        const [editing, setEditing] = useState(false);
+        const [res, setRes] = useState(null);
+        const [busy, setBusy] = useState(false);
+        const [err, setErr] = useState('');
+        const [copied, setCopied] = useState(false);
+        const [timedOut, setTimedOut] = useState(false);
+
+        const node = (id) => gun.get(ROOT).get(id);
+
+        useEffect(() => {
+          if (!eid) return;
+          const n = node(eid);
+          const metaRef = n.get('meta');
+          const dRef = n.get('drivers').map();
+          const pRef = n.get('passengers').map();
+
+          const apply = (prev, k, v) => {
+            const next = { ...prev };
+            if (!v || v.deleted) {
+              delete next[k];
+            } else {
+              next[k] = {
+                id: k,
+                name: v.name ?? '',
+                addr: parse(v.addr),
+                seats: v.seats,
+                t: Number(v.t) || 0,
+              };
+            }
+            return next;
+          };
+
+          metaRef.on((v) => {
+            if (!v || !v.name) return;
+            setMeta({ name: v.name, dest: parse(v.dest), time: v.time || '' });
+          });
+          dRef.on((v, k) => setDrivers((prev) => apply(prev, k, v)));
+          pRef.on((v, k) => setPassengers((prev) => apply(prev, k, v)));
+
+          return () => {
+            metaRef.off();
+            dRef.off();
+            pRef.off();
+          };
+        }, [eid]);
+
+        useEffect(() => {
+          if (eid && meta) {
+            localStorage.setItem(`carpool:${eid}`, JSON.stringify({ meta, drivers, passengers }));
+          }
+        }, [eid, meta, drivers, passengers]);
+
+        useEffect(() => {
+          if (!eid || meta) return;
+          const t = setTimeout(() => setTimedOut(true), 8000);
+          return () => clearTimeout(t);
+        }, [eid, meta]);
+
+        useEffect(() => {
+          setRes(null);
+        }, [drivers, passengers]);
+
+        const createEvent = (m) => {
+          const id = uid(12);
+          node(id).get('meta').put({ name: m.name, dest: JSON.stringify(m.dest), time: m.time });
+          history.replaceState(null, '', `${location.pathname}?event=${id}`);
+          setMeta(m);
+          setDrivers({});
+          setPassengers({});
+          setEid(id);
+        };
+
+        const saveEdit = (m) => {
+          node(eid).get('meta').put({ name: m.name, dest: JSON.stringify(m.dest), time: m.time });
+          setMeta(m);
+          setEditing(false);
+        };
+
+        const add = (kind, data) => {
+          const id = uid();
+          node(eid).get(kind).get(id).put({ ...data, t: Date.now(), deleted: false });
+        };
+
+        const write = (kind, id, patch) => {
+          const p = { ...patch };
+          if (p.addr !== undefined) p.addr = JSON.stringify(p.addr);
+          node(eid).get(kind).get(id).put(p);
+        };
+
+        const remove = (kind, id) => {
+          node(eid).get(kind).get(id).put({ deleted: true });
+          const setter = kind === 'drivers' ? setDrivers : setPassengers;
+          setter((prev) => {
+            const next = { ...prev };
+            delete next[id];
+            return next;
+          });
+        };
+
+        const copy = async () => {
+          try {
+            await navigator.clipboard.writeText(location.href);
+            setCopied(true);
+            setTimeout(() => setCopied(false), 1500);
+          } catch {}
+        };
+
+        const driverList = Object.values(drivers).sort((a, b) => a.t - b.t);
+        const passengerList = Object.values(passengers).sort((a, b) => a.t - b.t);
+
+        const optimize = async () => {
+          setErr('');
+          const dest = meta?.dest;
+          const ds = driverList.filter((d) => d.addr && d.name.trim());
+          const ps = passengerList.filter((p) => p.addr && p.name.trim());
+          if (!dest) return setErr('Set a match destination.');
+          if (!ds.length) return setErr('Add at least one driver with a name and address.');
+          if (!ps.length) return setErr('Add passengers with a name and address.');
+
+          setBusy(true);
+          try {
+            const pts = [dest, ...ds.map((d) => d.addr), ...ps.map((p) => p.addr)];
+            const M = await getMatrix(pts);
+            const D = ds.length;
+
+            const pairs = [];
+            ds.forEach((_, i) =>
+              ps.forEach((_, j) => {
+                const a = i + 1;
+                const b = D + 1 + j;
+                pairs.push({ i, j, c: M[a][b] + M[b][0] - M[a][0] });
+              })
+            );
+            pairs.sort((x, y) => x.c - y.c);
+
+            const seats = ds.map((d) => Math.max(0, parseInt(d.seats, 10) || 0));
+            const got = ds.map(() => []);
+            const taken = new Set();
+            for (const { i, j } of pairs) {
+              if (taken.has(j) || got[i].length >= seats[i]) continue;
+              got[i].push(j);
+              taken.add(j);
+            }
+
+            const cards = ds.map((d, i) => {
+              const rem = got[i].map((j) => D + 1 + j);
+              const seq = [];
+              let cur = i + 1;
+              while (rem.length) {
+                let bi = 0;
+                for (let k = 1; k < rem.length; k++) {
+                  if (M[cur][rem[k]] < M[cur][rem[bi]]) bi = k;
+                }
+                cur = rem[bi];
+                seq.push(cur);
+                rem.splice(bi, 1);
+              }
+              let total = 0;
+              let prev = i + 1;
+              seq.forEach((k) => {
+                total += M[prev][k];
+                prev = k;
+              });
+              total += M[prev][0];
+
+              const assigned = seq.map((k) => ps[k - D - 1]);
+              const wp = assigned.map((p) => p.addr.label);
+              const url =
+                `https://www.google.com/maps/dir/?api=1` +
+                `&origin=${encodeURIComponent(d.addr.label)}` +
+                `&destination=${encodeURIComponent(dest.label)}` +
+                (wp.length ? `&waypoints=${encodeURIComponent(wp.join('|'))}` : '');
+
+              return {
+                id: d.id,
+                name: d.name,
+                seats: seats[i],
+                passengers: assigned,
+                detour: Math.max(0, Math.round((total - M[i + 1][0]) / 60)),
+                url,
+              };
+            });
+
+            const un = ps.filter((_, j) => !taken.has(j));
+            setRes({ cards, un });
+          } catch {
+            setErr('Routing failed. Try again.');
+          } finally {
+            setBusy(false);
+          }
+        };
+
+        const shell = (children) => (
+          <div className="min-h-screen bg-white font-sans text-black">
+            <div className="mx-auto max-w-3xl px-4 py-6">
+              <header className="flex items-end justify-between border-b-4 border-black pb-3">
+                <h1 className="text-3xl font-black uppercase tracking-tight">Carpool</h1>
+                {eid && (
+                  <button onClick={copy} className="text-xs font-bold uppercase underline">
+                    {copied ? 'Copied' : 'Copy link'}
+                  </button>
+                )}
+              </header>
+              {children}
+            </div>
+          </div>
+        );
+
+        if (!eid) {
+          return shell(
+            <div className="mt-6">
+              <p className="mb-4 text-sm">Create a match. You will get a permanent link to share.</p>
+              <EventForm submitLabel="Create event" onSave={createEvent} />
+            </div>
+          );
+        }
+
+        if (!meta) {
+          return shell(
+            <p className="mt-10 text-sm font-bold">
+              {timedOut ? 'Event not found or the network is offline.' : 'Loading event…'}
+            </p>
+          );
+        }
+
+        return shell(
+          <>
+            <div className="mt-6 flex items-start justify-between gap-4">
+              <div className="space-y-1">
+                <h2 className="text-2xl font-black uppercase">{meta.name}</h2>
+                <p className="text-sm">{fmt(meta.time)}</p>
+                <p className="text-sm font-bold">{meta.dest?.label}</p>
+              </div>
+              <button onClick={() => setEditing((e) => !e)} className={btn}>
+                {editing ? 'Close' : 'Edit'}
+              </button>
+            </div>
+
+            {editing && (
+              <div className="mt-4">
+                <EventForm
+                  initial={meta}
+                  submitLabel="Save event"
+                  onSave={saveEdit}
+                  onCancel={() => setEditing(false)}
+                />
+              </div>
+            )}
+
+            <div className="mt-8 grid grid-cols-2 gap-6">
+              <div className="space-y-3">
+                <div className="flex items-center justify-between border-b-2 border-black pb-2">
+                  <h2 className="text-sm font-black uppercase">Drivers</h2>
+                  <button className={btn} onClick={() => add('drivers', { name: '', addr: '', seats: 3 })}>
+                    +
+                  </button>
+                </div>
+                {driverList.map((d) => (
+                  <DriverRow
+                    key={d.id}
+                    d={d}
+                    onPatch={(patch) => write('drivers', d.id, patch)}
+                    onRemove={() => remove('drivers', d.id)}
+                  />
+                ))}
+              </div>
+
+              <div className="space-y-3">
+                <div className="flex items-center justify-between border-b-2 border-black pb-2">
+                  <h2 className="text-sm font-black uppercase">Passengers</h2>
+                  <button className={btn} onClick={() => add('passengers', { name: '', addr: '' })}>
+                    +
+                  </button>
+                </div>
+                {passengerList.map((p) => (
+                  <PassengerRow
+                    key={p.id}
+                    p={p}
+                    onPatch={(patch) => write('passengers', p.id, patch)}
+                    onRemove={() => remove('passengers', p.id)}
+                  />
+                ))}
+              </div>
+            </div>
+
+            <button
+              onClick={optimize}
+              disabled={busy}
+              className="mt-8 w-full bg-black py-4 text-sm font-black uppercase tracking-widest text-white disabled:opacity-40"
+            >
+              {busy ? 'Optimizing…' : 'Optimize Cars'}
+            </button>
+            {err && <p className="mt-3 text-sm font-bold">{err}</p>}
+
+            {res && (
+              <section className="mt-10">
+                <h2 className="mb-4 border-b-4 border-black pb-2 text-xl font-black uppercase">Routes</h2>
+                <div className="grid gap-4 md:grid-cols-2">
+                  {res.cards.map((c) => (
+                    <article key={c.id} className="space-y-3 border-4 border-black p-4">
+                      <div className="flex items-baseline justify-between">
+                        <h3 className="text-lg font-black uppercase">{c.name}</h3>
+                        <span className="text-xs font-bold">
+                          {c.passengers.length}/{c.seats} seats
+                        </span>
+                      </div>
+                      <p className="text-xs font-bold uppercase">Detour +{c.detour} min</p>
+                      {c.passengers.length > 0 ? (
+                        <ol className="space-y-1 text-sm">
+                          {c.passengers.map((p, k) => (
+                            <li key={p.id}>
+                              {k + 1}. {p.name}
+                            </li>
+                          ))}
+                        </ol>
+                      ) : (
+                        <p className="text-sm">No passengers assigned.</p>
+                      )}
+                      <a
+                        href={c.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="block bg-black py-3 text-center text-xs font-bold uppercase tracking-wider text-white"
+                      >
+                        Open in Google Maps
+                      </a>
+                    </article>
+                  ))}
+                </div>
+
+                {res.un.length > 0 && (
+                  <div className="mt-6 border-2 border-dashed border-black p-4">
+                    <h3 className="text-xs font-black uppercase">Unassigned ({res.un.length})</h3>
+                    <ul className="mt-2 space-y-1 text-sm">
+                      {res.un.map((p) => (
+                        <li key={p.id}>
+                          {p.name} — {p.addr.label}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+              </section>
+            )}
+          </>
+        );
+      }
+
+      ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+    </script>
+  </body>
+</html>
