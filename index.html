@@ -1,680 +1,636 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Carpool</title>
-    <script>
-      (function () {
-        var t = localStorage.getItem('carpool:theme');
-        if (t === 'dark' || (!t && matchMedia('(prefers-color-scheme: dark)').matches)) {
-          document.documentElement.classList.add('dark');
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Carpool Map</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css" />
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.24.7/babel.min.js"></script>
+<style>
+  .cp-pin { background: none; border: none; }
+  .cp-label {
+    transform: translate(-50%, -110%);
+    background: #1e293b; color: #fff; font-weight: 700;
+    padding: 4px 10px; border-radius: 999px; white-space: nowrap;
+    box-shadow: 0 2px 6px rgba(0,0,0,.3); font-size: 13px; cursor: pointer;
+  }
+  .cp-hl { background: #f97316; transform: translate(-50%, -110%) scale(1.15); }
+  .cp-dest {
+    transform: translate(-50%, -110%);
+    background: #dc2626; color: #fff; font-weight: 800;
+    padding: 6px 12px; border-radius: 12px; white-space: nowrap;
+    box-shadow: 0 2px 8px rgba(0,0,0,.35); font-size: 14px;
+  }
+</style>
+</head>
+<body class="bg-slate-100">
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef, useMemo } = React;
+
+/* ------------------------------------------------------------------
+   Helpers
+------------------------------------------------------------------- */
+const TOPIC = (id) => `carpool_v1_${id}`;
+const uid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+const randomEventId = () => Math.random().toString(36).slice(2, 10);
+const esc = (s) => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const inp = "w-full rounded-xl border-2 border-slate-300 bg-white px-4 py-3 text-lg focus:border-blue-600 outline-none";
+const btn = "rounded-xl bg-blue-600 px-5 py-3 text-lg font-bold text-white shadow hover:bg-blue-700 disabled:opacity-50";
+
+function loadMine(id) {
+  try {
+    const m = JSON.parse(localStorage.getItem('carpool_mine_' + id));
+    return { cars: m?.cars || [], joins: m?.joins || [] };
+  } catch { return { cars: [], joins: [] }; }
+}
+
+async function geocode(q, signal) {
+  const r = await fetch(`https://nominatim.openstreetmap.org/search?format=json&limit=5&q=${encodeURIComponent(q)}`, { signal });
+  if (!r.ok) throw new Error('Address lookup failed. Check your connection.');
+  const j = await r.json();
+  return j.map(x => ({ lat: +x.lat, lng: +x.lon, label: x.display_name }));
+}
+
+// Publish an action to the event's ntfy topic. Plain-text body = simple CORS request.
+async function publish(topic, action) {
+  try {
+    const r = await fetch(`https://ntfy.sh/${topic}`, { method: 'POST', body: JSON.stringify(action) });
+    return r.ok;
+  } catch { return false; }
+}
+
+// Parse one ntfy envelope (SSE data or NDJSON line) into our action object.
+function parseNtfy(str) {
+  try {
+    const o = JSON.parse(str);
+    if (!o || o.event !== 'message' || typeof o.message !== 'string') return null;
+    const a = JSON.parse(o.message);
+    return isValidAction(a) ? a : null;
+  } catch { return null; }
+}
+
+function isValidAction(a) {
+  return a && typeof a === 'object' && typeof a.id === 'string' && typeof a.t === 'number' && typeof a.type === 'string';
+}
+
+/* ------------------------------------------------------------------
+   Deterministic reducer: sorted action log -> live state
+------------------------------------------------------------------- */
+function reduce(actions) {
+  let event = null;
+  const cars = new Map();
+  for (const a of actions) {
+    switch (a.type) {
+      case 'create':
+        if (!event && a.dest && Number.isFinite(a.dest.lat)) {
+          event = { name: a.name, dest: a.dest, when: a.when };
         }
-      })();
-    </script>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script>
-      tailwind.config = { darkMode: 'class' };
-    </script>
-    <script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
-    <script crossorigin src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
-    <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/gun/gun.js"></script>
-  </head>
-  <body class="bg-white dark:bg-black">
-    <div id="root"></div>
-    <script type="text/babel" data-presets="react">
-      const { useEffect, useRef, useState } = React;
-
-      const PEERS = [
-        'https://gun-manhattan.herokuapp.com/gun',
-        'https://peer.wallie.io/gun',
-        'https://gun-us.herokuapp.com/gun',
-        'https://gun-eu.herokuapp.com/gun',
-        'https://relay.peer.ooo/gun',
-      ];
-      const gun = Gun({ peers: PEERS, localStorage: true, radisk: true });
-      const ROOT = 'carpool-v2';
-
-      const uid = (n = 10) => Math.random().toString(36).slice(2, 2 + n);
-
-      const parse = (s) => {
-        if (s == null || s === '') return null;
-        if (typeof s !== 'string') return s;
-        try {
-          return JSON.parse(s);
-        } catch {
-          return null;
-        }
-      };
-
-      const fmt = (t) => {
-        const d = new Date(t);
-        return isNaN(d) ? t || '' : d.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
-      };
-
-      const clampSeats = (v) => Math.min(8, Math.max(1, parseInt(v, 10) || 1));
-
-      const hav = (a, b) => {
-        const R = 6371;
-        const r = (x) => (x * Math.PI) / 180;
-        const dLat = r(b.lat - a.lat);
-        const dLon = r(b.lon - a.lon);
-        const h =
-          Math.sin(dLat / 2) ** 2 +
-          Math.cos(r(a.lat)) * Math.cos(r(b.lat)) * Math.sin(dLon / 2) ** 2;
-        return 2 * R * Math.asin(Math.sqrt(h));
-      };
-
-      const getMatrix = async (pts) => {
-        const fallback = (i, k) => (hav(pts[i], pts[k]) / 40) * 3600;
-        try {
-          const coords = pts.map((p) => `${p.lon},${p.lat}`).join(';');
-          const r = await fetch(
-            `https://router.project-osrm.org/table/v1/driving/${coords}?annotations=duration`
-          );
-          const j = await r.json();
-          if (j.code !== 'Ok') throw new Error('osrm');
-          return pts.map((_, i) => pts.map((_, k) => j.durations[i][k] ?? fallback(i, k)));
-        } catch {
-          return pts.map((_, i) => pts.map((_, k) => fallback(i, k)));
-        }
-      };
-
-      const inp =
-        'w-full border-2 border-black bg-white px-3 py-2 text-sm text-black outline-none focus:bg-neutral-100 dark:border-white dark:bg-black dark:text-white dark:focus:bg-neutral-900';
-      const btn =
-        'border-2 border-black px-3 py-2 text-xs font-bold uppercase tracking-wider text-black hover:bg-black hover:text-white dark:border-white dark:text-white dark:hover:bg-white dark:hover:text-black';
-      const solid =
-        'bg-black text-white disabled:opacity-40 dark:bg-white dark:text-black';
-
-      function Field({ value, onCommit, ...rest }) {
-        const [v, setV] = useState(value ?? '');
-        const focused = useRef(false);
-        useEffect(() => {
-          if (!focused.current) setV(value ?? '');
-        }, [value]);
-        return (
-          <input
-            {...rest}
-            value={v}
-            className={inp}
-            onFocus={() => (focused.current = true)}
-            onChange={(e) => setV(e.target.value)}
-            onBlur={() => {
-              focused.current = false;
-              if (String(v) !== String(value ?? '')) onCommit(v);
-            }}
-          />
-        );
+        break;
+      case 'addCar': {
+        if (cars.has(a.carId)) break;
+        if (!Number.isFinite(a.addr?.lat)) break;
+        const n = Math.min(7, Math.max(1, parseInt(a.seats, 10) || 1));
+        cars.set(a.carId, {
+          id: a.carId, driver: a.driver, addr: a.addr,
+          seats: Array.from({ length: n }, () => null)
+        });
+        break;
       }
+      case 'join': {
+        const c = cars.get(a.carId);
+        if (c && a.seatIdx >= 0 && a.seatIdx < c.seats.length && !c.seats[a.seatIdx]) {
+          c.seats[a.seatIdx] = { name: a.name, id: a.id };
+        }
+        break;
+      }
+      case 'leave': {
+        const c = cars.get(a.carId);
+        if (c && c.seats[a.seatIdx] && c.seats[a.seatIdx].id === a.joinId) {
+          c.seats[a.seatIdx] = null;
+        }
+        break;
+      }
+      case 'deleteCar':
+        cars.delete(a.carId);
+        break;
+    }
+  }
+  return { event, cars: [...cars.values()] };
+}
 
-      function AddressInput({ value, onChange, placeholder }) {
-        const label = value?.label ?? '';
-        const [q, setQ] = useState(label);
-        const [items, setItems] = useState([]);
-        const [open, setOpen] = useState(false);
-        const focused = useRef(false);
-        const labelRef = useRef(label);
-        const timer = useRef(null);
-        const ctrl = useRef(null);
-        labelRef.current = label;
+/* ------------------------------------------------------------------
+   Real-time room hook: cache -> poll history -> SSE live updates
+------------------------------------------------------------------- */
+function useRoom(eventId) {
+  const [actions, setActions] = useState([]);
+  const [status, setStatus] = useState('connecting');
+  const storeRef = useRef(new Map());
+  const topic = TOPIC(eventId);
+  const cacheKey = `carpool_cache_${eventId}`;
 
-        useEffect(() => {
-          if (!focused.current) setQ(label);
-        }, [label]);
+  const flush = () => {
+    const arr = [...storeRef.current.values()].sort((a, b) =>
+      a.t - b.t || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    setActions(arr);
+    try { localStorage.setItem(cacheKey, JSON.stringify(arr)); } catch {}
+  };
 
-        useEffect(
-          () => () => {
-            clearTimeout(timer.current);
-            ctrl.current?.abort();
-          },
-          []
-        );
+  const ingest = (a) => {
+    if (!isValidAction(a) || storeRef.current.has(a.id)) return false;
+    storeRef.current.set(a.id, a);
+    return true;
+  };
 
-        const search = (text) => {
-          setQ(text);
-          clearTimeout(timer.current);
-          if (text.trim().length < 3) {
-            setItems([]);
-            setOpen(false);
-            return;
-          }
-          timer.current = setTimeout(async () => {
-            ctrl.current?.abort();
-            const c = new AbortController();
-            ctrl.current = c;
-            try {
-              const r = await fetch(
-                `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=5&q=${encodeURIComponent(text)}`,
-                { signal: c.signal }
-              );
-              const data = await r.json();
-              setItems(
-                data.map((x) => ({
-                  label: x.display_name.split(',').slice(0, 3).join(',').trim(),
-                  lat: parseFloat(x.lat),
-                  lon: parseFloat(x.lon),
-                }))
-              );
-              setOpen(true);
-            } catch (e) {
-              if (e.name !== 'AbortError') setItems([]);
-            }
-          }, 400);
-        };
+  useEffect(() => {
+    storeRef.current = new Map();
+    try { JSON.parse(localStorage.getItem(cacheKey) || '[]').forEach(ingest); } catch {}
+    flush();
 
-        const pick = (it) => {
-          setQ(it.label);
-          setItems([]);
-          setOpen(false);
-          onChange(it);
-        };
+    let cancelled = false;
+    let es = null;
+    const start = Math.floor(Date.now() / 1000) - 2;
 
-        return (
-          <div className="relative">
-            <input
-              value={q}
-              placeholder={placeholder}
-              className={inp}
-              onChange={(e) => search(e.target.value)}
-              onFocus={() => {
-                focused.current = true;
-                if (items.length) setOpen(true);
-              }}
-              onBlur={() => {
-                focused.current = false;
-                setTimeout(() => {
-                  setOpen(false);
-                  setQ(labelRef.current);
-                }, 150);
-              }}
-            />
-            {open && items.length > 0 && (
-              <ul className="absolute z-20 mt-1 w-full border-2 border-black bg-white dark:border-white dark:bg-black">
-                {items.map((it, k) => (
-                  <li key={k}>
-                    <button
-                      type="button"
-                      onMouseDown={(e) => {
-                        e.preventDefault();
-                        pick(it);
-                      }}
-                      className="block w-full px-3 py-2 text-left text-xs text-black hover:bg-black hover:text-white dark:text-white dark:hover:bg-white dark:hover:text-black"
-                    >
-                      {it.label}
-                    </button>
-                  </li>
-                ))}
-              </ul>
+    (async () => {
+      try {
+        const r = await fetch(`https://ntfy.sh/${topic}/json?poll=1&since=all`);
+        if (!r.ok) throw new Error('poll failed');
+        const text = await r.text();
+        let changed = false;
+        text.split('\n').forEach(line => {
+          const a = parseNtfy(line);
+          if (a && ingest(a)) changed = true;
+        });
+        if (changed && !cancelled) flush();
+        if (!cancelled) setStatus('live');
+      } catch {
+        if (!cancelled) setStatus('offline');
+      }
+      if (cancelled) return;
+
+      es = new EventSource(`https://ntfy.sh/${topic}/sse?since=${start}`);
+      es.onopen = () => { if (!cancelled) setStatus('live'); };
+      es.onmessage = (e) => {
+        if (cancelled) return;
+        const a = parseNtfy(e.data);
+        if (a && ingest(a)) flush();
+      };
+      es.onerror = () => { if (!cancelled) setStatus('offline'); };
+    })();
+
+    return () => { cancelled = true; if (es) es.close(); };
+  }, [eventId]);
+
+  // Optimistic local apply, then broadcast.
+  const send = (action) => {
+    if (ingest(action)) flush();
+    return publish(topic, action).then(ok => {
+      if (!ok) setStatus('offline');
+      return ok;
+    });
+  };
+
+  return { actions, status, send };
+}
+
+/* ------------------------------------------------------------------
+   Address autocomplete (Nominatim)
+------------------------------------------------------------------- */
+function AddressInput({ value, onText, onPick, placeholder }) {
+  const [items, setItems] = useState([]);
+  const [open, setOpen] = useState(false);
+
+  useEffect(() => {
+    if (!open || value.trim().length < 3) { setItems([]); return; }
+    const ac = new AbortController();
+    const t = setTimeout(async () => {
+      try { setItems(await geocode(value, ac.signal)); } catch {}
+    }, 400);
+    return () => { clearTimeout(t); ac.abort(); };
+  }, [value, open]);
+
+  return (
+    <div className="relative">
+      <input
+        className={inp}
+        value={value}
+        placeholder={placeholder}
+        onChange={e => { onText(e.target.value); onPick(null); setOpen(true); }}
+        onFocus={() => setOpen(true)}
+        onBlur={() => setTimeout(() => setOpen(false), 150)}
+      />
+      {open && items.length > 0 && (
+        <ul className="absolute z-[1000] mt-1 w-full overflow-hidden rounded-xl border bg-white shadow-xl">
+          {items.map((it, i) => (
+            <li key={i}>
+              <button
+                type="button"
+                className="w-full px-3 py-2 text-left text-sm hover:bg-slate-100"
+                onMouseDown={e => e.preventDefault()}
+                onClick={() => { onPick(it); onText(it.label); setOpen(false); }}
+              >{it.label}</button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------
+   Home: create event
+------------------------------------------------------------------- */
+function Home({ onCreated }) {
+  const [name, setName] = useState('');
+  const [destText, setDestText] = useState('');
+  const [dest, setDest] = useState(null);
+  const [when, setWhen] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+
+  async function submit(e) {
+    e.preventDefault();
+    if (!name.trim() || !when || !destText.trim()) {
+      setErr('Please fill in the match name, destination and time.');
+      return;
+    }
+    setBusy(true); setErr('');
+    try {
+      let d = dest;
+      if (!d) {
+        const r = await geocode(destText);
+        if (!r.length) throw new Error('Destination not found. Try a more specific address.');
+        d = r[0];
+      }
+      const id = randomEventId();
+      const action = {
+        id: uid(), t: Date.now(), type: 'create',
+        name: name.trim().slice(0, 80),
+        dest: { lat: d.lat, lng: d.lng, label: d.label },
+        when: new Date(when).toISOString()
+      };
+      try { localStorage.setItem(`carpool_cache_${id}`, JSON.stringify([action])); } catch {}
+      await publish(TOPIC(id), action);
+      onCreated(id);
+    } catch (ex) {
+      setErr(ex.message || 'Could not create event.');
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="min-h-screen flex items-center justify-center p-4 bg-gradient-to-br from-blue-600 to-emerald-500">
+      <form onSubmit={submit} className="w-full max-w-lg rounded-3xl bg-white p-8 shadow-2xl space-y-5">
+        <div>
+          <h1 className="text-4xl font-black">🚗 Carpool Map</h1>
+          <p className="mt-2 text-slate-600 text-lg">Create a match event, then share the link so everyone can add cars and seats.</p>
+        </div>
+        <div>
+          <label className="block font-bold mb-1">Match name</label>
+          <input className={inp} value={name} onChange={e => setName(e.target.value)} placeholder="e.g. Real Madrid vs Barça" />
+        </div>
+        <div>
+          <label className="block font-bold mb-1">Destination</label>
+          <AddressInput value={destText} onText={setDestText} onPick={setDest} placeholder="Stadium or venue address" />
+        </div>
+        <div>
+          <label className="block font-bold mb-1">Date and time</label>
+          <input type="datetime-local" className={inp} value={when} onChange={e => setWhen(e.target.value)} />
+        </div>
+        {err && <p className="rounded-xl bg-red-100 p-3 font-semibold text-red-700">{err}</p>}
+        <button type="submit" disabled={busy} className={btn + " w-full"}>
+          {busy ? 'Creating…' : 'Create Event'}
+        </button>
+      </form>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------
+   Leaflet map
+------------------------------------------------------------------- */
+function RoomMap({ dest, cars, highlight, onPick }) {
+  const boxRef = useRef(null);
+  const mapRef = useRef(null);
+  const layerRef = useRef(null);
+  const fitKeyRef = useRef('');
+
+  useEffect(() => {
+    if (!window.L || mapRef.current) return;
+    const map = window.L.map(boxRef.current).setView([40.4168, -3.7038], 5);
+    window.L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19,
+      attribution: '&copy; OpenStreetMap contributors'
+    }).addTo(map);
+    mapRef.current = map;
+    layerRef.current = window.L.layerGroup().addTo(map);
+  }, []);
+
+  useEffect(() => {
+    const map = mapRef.current, layer = layerRef.current;
+    if (!map || !layer) return;
+    layer.clearLayers();
+    const pts = [];
+
+    if (dest) {
+      const label = esc(dest.label.split(',').slice(0, 2).join(','));
+      layer.addLayer(window.L.marker([dest.lat, dest.lng], {
+        icon: window.L.divIcon({
+          className: 'cp-pin',
+          html: `<div class="cp-dest">🏟 ${label}</div>`,
+          iconSize: [0, 0], iconAnchor: [0, 0]
+        })
+      }));
+      pts.push([dest.lat, dest.lng]);
+    }
+
+    cars.forEach(car => {
+      const hl = car.id === highlight;
+      const marker = window.L.marker([car.addr.lat, car.addr.lng], {
+        icon: window.L.divIcon({
+          className: 'cp-pin',
+          html: `<div class="cp-label ${hl ? 'cp-hl' : ''}">🚗 ${esc(car.driver)}</div>`,
+          iconSize: [0, 0], iconAnchor: [0, 0]
+        })
+      });
+      marker.on('click', () => onPick(car.id));
+      layer.addLayer(marker);
+      pts.push([car.addr.lat, car.addr.lng]);
+    });
+
+    // Only refit when the set of locations changes, not on every highlight.
+    const key = pts.map(p => p.join(',')).join(';');
+    if (pts.length && key !== fitKeyRef.current) {
+      fitKeyRef.current = key;
+      if (pts.length === 1) map.setView(pts[0], 13);
+      else map.fitBounds(pts, { padding: [40, 40], maxZoom: 14 });
+    }
+  }, [dest, cars, highlight]);
+
+  return <div ref={boxRef} className="h-[420px] w-full rounded-2xl overflow-hidden shadow-lg" />;
+}
+
+/* ------------------------------------------------------------------
+   Car card
+------------------------------------------------------------------- */
+function CarCard({ car, highlighted, isMine, myJoins, onJoin, onLeave, onRemove }) {
+  const free = car.seats.filter(s => !s).length;
+  return (
+    <div
+      id={`car-${car.id}`}
+      className={`rounded-3xl bg-white p-6 shadow-lg border-4 transition ${highlighted ? 'border-orange-500' : 'border-transparent'}`}
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <p className="text-sm font-bold uppercase tracking-wide text-slate-500">Driver</p>
+          <h3 className="text-3xl font-black break-words">🚗 {car.driver}</h3>
+        </div>
+        {isMine && (
+          <button onClick={() => onRemove(car)} className="shrink-0 text-sm font-semibold text-red-600 underline">Remove car</button>
+        )}
+      </div>
+      <p className="mt-3 text-base text-slate-700 break-words">📍 {car.addr.label}</p>
+      <p className={`mt-4 text-lg font-extrabold ${free ? 'text-emerald-700' : 'text-red-600'}`}>
+        {free ? `${free} seat${free > 1 ? 's' : ''} free` : 'Full'}
+      </p>
+      <div className="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-3">
+        <div className="flex items-center justify-center rounded-2xl bg-blue-600 p-4 text-lg font-bold text-white">
+          🧑‍✈️ Driver
+        </div>
+        {car.seats.map((s, i) => s ? (
+          <div key={i} className="flex items-center justify-between gap-2 rounded-2xl border-2 border-emerald-500 bg-emerald-100 p-4">
+            <span className="truncate text-lg font-bold">👤 {s.name}</span>
+            {myJoins.includes(s.id) && (
+              <button onClick={() => onLeave(car, i)} className="shrink-0 rounded-lg bg-white px-2 py-1 text-sm font-bold text-red-600 shadow">Leave</button>
             )}
           </div>
-        );
+        ) : (
+          <button
+            key={i}
+            onClick={() => onJoin(car, i)}
+            className="rounded-2xl border-2 border-dashed border-slate-400 p-4 text-lg font-bold text-slate-600 hover:border-blue-600 hover:bg-blue-50"
+          >+ Join</button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------
+   Add car form
+------------------------------------------------------------------- */
+function AddCarForm({ onAdd }) {
+  const [driver, setDriver] = useState('');
+  const [addrText, setAddrText] = useState('');
+  const [addr, setAddr] = useState(null);
+  const [seats, setSeats] = useState(3);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+
+  async function submit(e) {
+    e.preventDefault();
+    if (!driver.trim() || !addrText.trim()) {
+      setErr('Driver name and departure address are required.');
+      return;
+    }
+    setBusy(true); setErr('');
+    try {
+      let a = addr;
+      if (!a) {
+        const r = await geocode(addrText);
+        if (!r.length) throw new Error('Address not found. Try a more specific address.');
+        a = r[0];
       }
+      onAdd({ driver: driver.trim(), addr: { lat: a.lat, lng: a.lng, label: a.label }, seats });
+      setDriver(''); setAddrText(''); setAddr(null); setSeats(3);
+    } catch (ex) {
+      setErr(ex.message || 'Could not add car.');
+    }
+    setBusy(false);
+  }
 
-      function EventForm({ initial, submitLabel, onSave, onCancel }) {
-        const [name, setName] = useState(initial?.name ?? '');
-        const [dest, setDest] = useState(initial?.dest ?? null);
-        const [time, setTime] = useState(initial?.time ?? '');
-        const [err, setErr] = useState('');
+  return (
+    <form onSubmit={submit} className="space-y-4 rounded-3xl bg-white p-6 shadow-lg lg:sticky lg:top-24">
+      <h2 className="text-2xl font-black">+ Add Car</h2>
+      <div>
+        <label className="mb-1 block font-bold">Driver name</label>
+        <input className={inp} value={driver} onChange={e => setDriver(e.target.value)} placeholder="Your name" />
+      </div>
+      <div>
+        <label className="mb-1 block font-bold">Departure address</label>
+        <AddressInput value={addrText} onText={setAddrText} onPick={setAddr} placeholder="Where you pick people up" />
+      </div>
+      <div>
+        <label className="mb-1 block font-bold">Passenger seats</label>
+        <select className={inp} value={seats} onChange={e => setSeats(+e.target.value)}>
+          {[1, 2, 3, 4, 5, 6, 7].map(n => <option key={n} value={n}>{n} seat{n > 1 ? 's' : ''}</option>)}
+        </select>
+      </div>
+      {err && <p className="rounded-xl bg-red-100 p-3 font-semibold text-red-700">{err}</p>}
+      <button type="submit" disabled={busy} className={btn + " w-full"}>
+        {busy ? 'Adding…' : 'Add Car'}
+      </button>
+    </form>
+  );
+}
 
-        const submit = () => {
-          if (!name.trim()) return setErr('Name the match.');
-          if (!dest) return setErr('Pick a destination from the list.');
-          if (!time) return setErr('Set date and time.');
-          setErr('');
-          onSave({ name: name.trim(), dest, time });
-        };
+/* ------------------------------------------------------------------
+   Room: live event page
+------------------------------------------------------------------- */
+function Room({ eventId }) {
+  const { actions, status, send } = useRoom(eventId);
+  const { event, cars } = useMemo(() => reduce(actions), [actions]);
+  const [mine, setMine] = useState(() => loadMine(eventId));
+  const [highlight, setHighlight] = useState(null);
+  const [copied, setCopied] = useState(false);
 
-        return (
-          <div className="space-y-3 border-2 border-black p-4 dark:border-white">
-            <label className="block text-xs font-bold uppercase tracking-wider">Match name</label>
-            <input
-              className={inp}
-              placeholder="Home vs Away"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-            />
-            <label className="block text-xs font-bold uppercase tracking-wider">Destination</label>
-            <AddressInput value={dest} onChange={setDest} placeholder="Stadium or address" />
-            <label className="block text-xs font-bold uppercase tracking-wider">Date and time</label>
-            <input
-              type="datetime-local"
-              className={inp}
-              value={time}
-              onChange={(e) => setTime(e.target.value)}
-            />
-            {err && <p className="text-sm font-bold">{err}</p>}
-            <div className="flex gap-2">
-              <button onClick={submit} className={`flex-1 py-3 text-xs font-black uppercase tracking-widest ${solid}`}>
-                {submitLabel}
-              </button>
-              {onCancel && (
-                <button onClick={onCancel} className={btn}>
-                  Cancel
-                </button>
-              )}
-            </div>
-          </div>
-        );
-      }
+  const updateMine = (m) => {
+    setMine(m);
+    try { localStorage.setItem('carpool_mine_' + eventId, JSON.stringify(m)); } catch {}
+  };
 
-      function DriverRow({ d, onPatch, onRemove }) {
-        return (
-          <div className="space-y-2 border-2 border-black p-3 dark:border-white">
-            <Field placeholder="Name" value={d.name} onCommit={(name) => onPatch({ name })} />
-            <AddressInput value={d.addr} placeholder="Origin address" onChange={(addr) => onPatch({ addr })} />
-            <div className="flex items-center gap-2">
-              <Field
-                type="number"
-                min="1"
-                max="8"
-                placeholder="Seats"
-                value={d.seats}
-                onCommit={(v) => onPatch({ seats: clampSeats(v) })}
-              />
-              <button className={btn} onClick={onRemove}>×</button>
-            </div>
-          </div>
-        );
-      }
+  const copy = async () => {
+    const url = window.location.href;
+    try {
+      await navigator.clipboard.writeText(url);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      window.prompt('Copy this link:', url);
+    }
+  };
 
-      function PassengerRow({ p, onPatch, onRemove }) {
-        return (
-          <div className="space-y-2 border-2 border-black p-3 dark:border-white">
-            <Field placeholder="Name" value={p.name} onCommit={(name) => onPatch({ name })} />
-            <AddressInput value={p.addr} placeholder="Pickup address" onChange={(addr) => onPatch({ addr })} />
-            <button className={btn} onClick={onRemove}>Remove</button>
-          </div>
-        );
-      }
+  const pickOnMap = (carId) => {
+    setHighlight(carId);
+    const el = document.getElementById(`car-${carId}`);
+    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  };
 
-      function readCache(eid) {
-        try {
-          return JSON.parse(localStorage.getItem(`carpool:${eid}`)) || null;
-        } catch {
-          return null;
-        }
-      }
+  const addCar = ({ driver, addr, seats }) => {
+    const carId = uid();
+    send({ id: uid(), t: Date.now(), type: 'addCar', carId, driver: driver.slice(0, 40), addr, seats });
+    updateMine({ ...mine, cars: [...mine.cars, carId] });
+  };
 
-      function App() {
-        const initEid = new URLSearchParams(location.search).get('event') || '';
-        const [cached] = useState(() => (initEid ? readCache(initEid) : null));
-        const [eid, setEid] = useState(initEid);
-        const [meta, setMeta] = useState(cached?.meta ?? null);
-        const [drivers, setDrivers] = useState(cached?.drivers ?? {});
-        const [passengers, setPassengers] = useState(cached?.passengers ?? {});
-        const [editing, setEditing] = useState(false);
-        const [res, setRes] = useState(null);
-        const [busy, setBusy] = useState(false);
-        const [err, setErr] = useState('');
-        const [copied, setCopied] = useState(false);
-        const [timedOut, setTimedOut] = useState(false);
-        const [dark, setDark] = useState(() => document.documentElement.classList.contains('dark'));
+  const join = (car, idx) => {
+    const name = window.prompt('Passenger name?');
+    if (!name || !name.trim()) return;
+    const joinId = uid();
+    send({ id: joinId, t: Date.now(), type: 'join', carId: car.id, seatIdx: idx, name: name.trim().slice(0, 40) });
+    updateMine({ ...mine, joins: [...mine.joins, joinId] });
+  };
 
-        const node = (id) => gun.get(ROOT).get(id);
+  const leave = (car, idx) => {
+    const s = car.seats[idx];
+    if (!s) return;
+    send({ id: uid(), t: Date.now(), type: 'leave', carId: car.id, seatIdx: idx, joinId: s.id });
+    updateMine({ ...mine, joins: mine.joins.filter(j => j !== s.id) });
+  };
 
-        const toggleTheme = () => {
-          const next = !dark;
-          document.documentElement.classList.toggle('dark', next);
-          localStorage.setItem('carpool:theme', next ? 'dark' : 'light');
-          setDark(next);
-        };
+  const removeCar = (car) => {
+    if (!window.confirm(`Remove ${car.driver}'s car?`)) return;
+    send({ id: uid(), t: Date.now(), type: 'deleteCar', carId: car.id });
+    updateMine({ ...mine, cars: mine.cars.filter(c => c !== car.id) });
+  };
 
-        useEffect(() => {
-          if (!eid) return;
-          const n = node(eid);
-          const metaRef = n.get('meta');
-          const dRef = n.get('drivers').map();
-          const pRef = n.get('passengers').map();
+  const pill = {
+    live: ['bg-emerald-500', 'Live'],
+    connecting: ['bg-amber-400', 'Connecting…'],
+    offline: ['bg-red-500', 'Offline (cached)']
+  }[status];
 
-          const apply = (prev, k, v) => {
-            const next = { ...prev };
-            if (!v || v.deleted) {
-              delete next[k];
-            } else {
-              next[k] = {
-                id: k,
-                name: v.name ?? '',
-                addr: parse(v.addr),
-                seats: v.seats,
-                t: Number(v.t) || 0,
-              };
-            }
-            return next;
-          };
+  const whenText = event ? new Date(event.when).toLocaleString(undefined, {
+    weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit'
+  }) : '';
 
-          metaRef.on((v) => {
-            if (!v || !v.name) return;
-            setMeta({ name: v.name, dest: parse(v.dest), time: v.time || '' });
-          });
-          dRef.on((v, k) => setDrivers((prev) => apply(prev, k, v)));
-          pRef.on((v, k) => setPassengers((prev) => apply(prev, k, v)));
-
-          return () => {
-            metaRef.off();
-            dRef.off();
-            pRef.off();
-          };
-        }, [eid]);
-
-        useEffect(() => {
-          if (eid && meta) {
-            localStorage.setItem(`carpool:${eid}`, JSON.stringify({ meta, drivers, passengers }));
-          }
-        }, [eid, meta, drivers, passengers]);
-
-        useEffect(() => {
-          if (!eid || meta) return;
-          const t = setTimeout(() => setTimedOut(true), 12000);
-          return () => clearTimeout(t);
-        }, [eid, meta]);
-
-        useEffect(() => {
-          setRes(null);
-        }, [drivers, passengers]);
-
-        const createEvent = (m) => {
-          const id = uid(12);
-          node(id).get('meta').put({ name: m.name, dest: JSON.stringify(m.dest), time: m.time });
-          history.replaceState(null, '', `${location.pathname}?event=${id}`);
-          setMeta(m);
-          setDrivers({});
-          setPassengers({});
-          setEid(id);
-        };
-
-        const saveEdit = (m) => {
-          node(eid).get('meta').put({ name: m.name, dest: JSON.stringify(m.dest), time: m.time });
-          setMeta(m);
-          setEditing(false);
-        };
-
-        const add = (kind, data) => {
-          const id = uid();
-          node(eid).get(kind).get(id).put({ ...data, t: Date.now(), deleted: false });
-        };
-
-        const write = (kind, id, patch) => {
-          const p = { ...patch };
-          if (p.addr !== undefined) p.addr = JSON.stringify(p.addr);
-          node(eid).get(kind).get(id).put(p);
-        };
-
-        const remove = (kind, id) => {
-          node(eid).get(kind).get(id).put({ deleted: true });
-          const setter = kind === 'drivers' ? setDrivers : setPassengers;
-          setter((prev) => {
-            const next = { ...prev };
-            delete next[id];
-            return next;
-          });
-        };
-
-        const copy = async () => {
-          try {
-            await navigator.clipboard.writeText(location.href);
-            setCopied(true);
-            setTimeout(() => setCopied(false), 1500);
-          } catch {}
-        };
-
-        const driverList = Object.values(drivers).sort((a, b) => a.t - b.t);
-        const passengerList = Object.values(passengers).sort((a, b) => a.t - b.t);
-
-        const optimize = async () => {
-          setErr('');
-          const dest = meta?.dest;
-          const ds = driverList.filter((d) => d.addr && d.name.trim());
-          const ps = passengerList.filter((p) => p.addr && p.name.trim());
-          if (!dest) return setErr('Set a match destination.');
-          if (!ds.length) return setErr('Add at least one driver with a name and address.');
-          if (!ps.length) return setErr('Add passengers with a name and address.');
-
-          setBusy(true);
-          try {
-            const pts = [dest, ...ds.map((d) => d.addr), ...ps.map((p) => p.addr)];
-            const M = await getMatrix(pts);
-            const D = ds.length;
-
-            const pairs = [];
-            ds.forEach((_, i) =>
-              ps.forEach((_, j) => {
-                const a = i + 1;
-                const b = D + 1 + j;
-                pairs.push({ i, j, c: M[a][b] + M[b][0] - M[a][0] });
-              })
-            );
-            pairs.sort((x, y) => x.c - y.c);
-
-            const seats = ds.map((d) => Math.max(0, parseInt(d.seats, 10) || 0));
-            const got = ds.map(() => []);
-            const taken = new Set();
-            for (const { i, j } of pairs) {
-              if (taken.has(j) || got[i].length >= seats[i]) continue;
-              got[i].push(j);
-              taken.add(j);
-            }
-
-            const cards = ds.map((d, i) => {
-              const rem = got[i].map((j) => D + 1 + j);
-              const seq = [];
-              let cur = i + 1;
-              while (rem.length) {
-                let bi = 0;
-                for (let k = 1; k < rem.length; k++) {
-                  if (M[cur][rem[k]] < M[cur][rem[bi]]) bi = k;
-                }
-                cur = rem[bi];
-                seq.push(cur);
-                rem.splice(bi, 1);
-              }
-              let total = 0;
-              let prev = i + 1;
-              seq.forEach((k) => {
-                total += M[prev][k];
-                prev = k;
-              });
-              total += M[prev][0];
-
-              const assigned = seq.map((k) => ps[k - D - 1]);
-              const wp = assigned.map((p) => p.addr.label);
-              const url =
-                `https://www.google.com/maps/dir/?api=1` +
-                `&origin=${encodeURIComponent(d.addr.label)}` +
-                `&destination=${encodeURIComponent(dest.label)}` +
-                (wp.length ? `&waypoints=${encodeURIComponent(wp.join('|'))}` : '');
-
-              return {
-                id: d.id,
-                name: d.name,
-                seats: seats[i],
-                passengers: assigned,
-                detour: Math.max(0, Math.round((total - M[i + 1][0]) / 60)),
-                url,
-              };
-            });
-
-            const un = ps.filter((_, j) => !taken.has(j));
-            setRes({ cards, un });
-          } catch {
-            setErr('Routing failed. Try again.');
-          } finally {
-            setBusy(false);
-          }
-        };
-
-        const shell = (children) => (
-          <div className="min-h-screen bg-white font-sans text-black dark:bg-black dark:text-white">
-            <div className="mx-auto max-w-3xl px-4 py-6">
-              <header className="flex items-end justify-between border-b-4 border-black pb-3 dark:border-white">
-                <h1 className="text-3xl font-black uppercase tracking-tight">Carpool</h1>
-                <div className="flex gap-4">
-                  {eid && (
-                    <button onClick={copy} className="text-xs font-bold uppercase underline">
-                      {copied ? 'Copied' : 'Copy link'}
-                    </button>
-                  )}
-                  <button onClick={toggleTheme} className="text-xs font-bold uppercase underline">
-                    {dark ? 'Light' : 'Dark'}
-                  </button>
-                </div>
-              </header>
-              {children}
-            </div>
-          </div>
-        );
-
-        if (!eid) {
-          return shell(
-            <div className="mt-6">
-              <p className="mb-4 text-sm">Create a match. You will get a permanent link to share.</p>
-              <EventForm submitLabel="Create event" onSave={createEvent} />
-            </div>
-          );
-        }
-
-        if (!meta) {
-          return shell(
-            <div className="mt-10 space-y-3">
-              <p className="text-sm font-bold">
-                {timedOut
-                  ? 'Event not found yet. Check your connection and reload the page.'
-                  : 'Loading event…'}
+  return (
+    <div className="min-h-screen bg-slate-100 text-slate-900">
+      <header className="sticky top-0 z-[500] bg-white shadow">
+        <div className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-3 px-4 py-4">
+          <div className="min-w-0">
+            <h1 className="truncate text-2xl font-extrabold sm:text-3xl">
+              {event ? event.name : 'Loading match…'}
+            </h1>
+            {event && (
+              <p className="text-slate-600">
+                📍 {event.dest.label.split(',').slice(0, 2).join(',')} · 🕒 {whenText}
               </p>
-              {timedOut && (
-                <button onClick={() => location.reload()} className={btn}>
-                  Reload
-                </button>
-              )}
-            </div>
-          );
-        }
+            )}
+          </div>
+          <div className="flex items-center gap-2">
+            <span className="flex items-center gap-2 rounded-full bg-slate-100 px-3 py-1 text-sm font-semibold">
+              <span className={`inline-block h-3 w-3 rounded-full ${pill[0]}`}></span>{pill[1]}
+            </span>
+            <button onClick={copy} className={btn}>{copied ? 'Copied!' : 'Copy Link'}</button>
+          </div>
+        </div>
+      </header>
 
-        return shell(
-          <>
-            <div className="mt-6 flex items-start justify-between gap-4">
-              <div className="space-y-1">
-                <h2 className="text-2xl font-black uppercase">{meta.name}</h2>
-                <p className="text-sm">{fmt(meta.time)}</p>
-                <p className="text-sm font-bold">{meta.dest?.label}</p>
-              </div>
-              <button onClick={() => setEditing((e) => !e)} className={btn}>
-                {editing ? 'Close' : 'Edit'}
-              </button>
-            </div>
+      <main className="mx-auto max-w-6xl space-y-6 p-4">
+        {event ? (
+          <RoomMap dest={event.dest} cars={cars} highlight={highlight} onPick={pickOnMap} />
+        ) : (
+          <div className="flex h-[200px] items-center justify-center rounded-2xl bg-white text-lg text-slate-500 shadow">
+            {status === 'offline' ? 'Event not found or you are offline.' : 'Connecting to event…'}
+          </div>
+        )}
 
-            {editing && (
-              <div className="mt-4">
-                <EventForm
-                  initial={meta}
-                  submitLabel="Save event"
-                  onSave={saveEdit}
-                  onCancel={() => setEditing(false)}
-                />
+        <div className="grid gap-6 lg:grid-cols-3">
+          <section className="space-y-6 lg:col-span-2">
+            {cars.length === 0 && (
+              <div className="rounded-3xl bg-white p-8 text-center text-lg text-slate-500 shadow">
+                No cars yet. Add the first one!
               </div>
             )}
+            {cars.map(car => (
+              <CarCard
+                key={car.id}
+                car={car}
+                highlighted={highlight === car.id}
+                isMine={mine.cars.includes(car.id)}
+                myJoins={mine.joins}
+                onJoin={join}
+                onLeave={leave}
+                onRemove={removeCar}
+              />
+            ))}
+          </section>
+          <aside className="lg:col-span-1">
+            <AddCarForm onAdd={addCar} />
+          </aside>
+        </div>
+      </main>
+    </div>
+  );
+}
 
-            <div className="mt-8 grid grid-cols-2 gap-6">
-              <div className="space-y-3">
-                <div className="flex items-center justify-between border-b-2 border-black pb-2 dark:border-white">
-                  <h2 className="text-sm font-black uppercase">Drivers</h2>
-                  <button className={btn} onClick={() => add('drivers', { name: '', addr: '', seats: 3 })}>
-                    +
-                  </button>
-                </div>
-                {driverList.map((d) => (
-                  <DriverRow
-                    key={d.id}
-                    d={d}
-                    onPatch={(patch) => write('drivers', d.id, patch)}
-                    onRemove={() => remove('drivers', d.id)}
-                  />
-                ))}
-              </div>
+/* ------------------------------------------------------------------
+   App: routing by ?event=<id>
+------------------------------------------------------------------- */
+function App() {
+  const [eventId, setEventId] = useState(() => new URLSearchParams(window.location.search).get('event'));
 
-              <div className="space-y-3">
-                <div className="flex items-center justify-between border-b-2 border-black pb-2 dark:border-white">
-                  <h2 className="text-sm font-black uppercase">Passengers</h2>
-                  <button className={btn} onClick={() => add('passengers', { name: '', addr: '' })}>
-                    +
-                  </button>
-                </div>
-                {passengerList.map((p) => (
-                  <PassengerRow
-                    key={p.id}
-                    p={p}
-                    onPatch={(patch) => write('passengers', p.id, patch)}
-                    onRemove={() => remove('passengers', p.id)}
-                  />
-                ))}
-              </div>
-            </div>
+  useEffect(() => {
+    const onPop = () => setEventId(new URLSearchParams(window.location.search).get('event'));
+    window.addEventListener('popstate', onPop);
+    return () => window.removeEventListener('popstate', onPop);
+  }, []);
 
-            <button
-              onClick={optimize}
-              disabled={busy}
-              className={`mt-8 w-full py-4 text-sm font-black uppercase tracking-widest ${solid}`}
-            >
-              {busy ? 'Optimizing…' : 'Optimize Cars'}
-            </button>
-            {err && <p className="mt-3 text-sm font-bold">{err}</p>}
+  if (eventId) return <Room key={eventId} eventId={eventId} />;
+  return (
+    <Home onCreated={(id) => {
+      window.history.pushState({}, '', `?event=${id}`);
+      setEventId(id);
+    }} />
+  );
+}
 
-            {res && (
-              <section className="mt-10">
-                <h2 className="mb-4 border-b-4 border-black pb-2 text-xl font-black uppercase dark:border-white">Routes</h2>
-                <div className="grid gap-4 md:grid-cols-2">
-                  {res.cards.map((c) => (
-                    <article key={c.id} className="space-y-3 border-4 border-black p-4 dark:border-white">
-                      <div className="flex items-baseline justify-between">
-                        <h3 className="text-lg font-black uppercase">{c.name}</h3>
-                        <span className="text-xs font-bold">
-                          {c.passengers.length}/{c.seats} seats
-                        </span>
-                      </div>
-                      <p className="text-xs font-bold uppercase">Detour +{c.detour} min</p>
-                      {c.passengers.length > 0 ? (
-                        <ol className="space-y-1 text-sm">
-                          {c.passengers.map((p, k) => (
-                            <li key={p.id}>
-                              {k + 1}. {p.name}
-                            </li>
-                          ))}
-                        </ol>
-                      ) : (
-                        <p className="text-sm">No passengers assigned.</p>
-                      )}
-                      <a
-                        href={c.url}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className={`block py-3 text-center text-xs font-bold uppercase tracking-wider ${solid}`}
-                      >
-                        Open in Google Maps
-                      </a>
-                    </article>
-                  ))}
-                </div>
-
-                {res.un.length > 0 && (
-                  <div className="mt-6 border-2 border-dashed border-black p-4 dark:border-white">
-                    <h3 className="text-xs font-black uppercase">Unassigned ({res.un.length})</h3>
-                    <ul className="mt-2 space-y-1 text-sm">
-                      {res.un.map((p) => (
-                        <li key={p.id}>
-                          {p.name} — {p.addr.label}
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
-                )}
-              </section>
-            )}
-          </>
-        );
-      }
-
-      ReactDOM.createRoot(document.getElementById('root')).render(<App />);
-    </script>
-  </body>
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
 </html>
