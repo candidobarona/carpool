@@ -3,7 +3,8 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Carpool Map</title>
+<title>🦁 Carpool Map</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🦁</text></svg>" />
 <script src="https://cdn.tailwindcss.com"></script>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css" />
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
@@ -14,17 +15,31 @@
   .cp-pin { background: none; border: none; }
   .cp-label {
     transform: translate(-50%, -110%);
-    background: #1e293b; color: #fff; font-weight: 700;
+    background: #ffffff !important; color: #000000 !important; font-weight: 700;
     padding: 4px 10px; border-radius: 999px; white-space: nowrap;
     box-shadow: 0 2px 6px rgba(0,0,0,.3); font-size: 13px; cursor: pointer;
   }
-  .cp-hl { background: #f97316; transform: translate(-50%, -110%) scale(1.15); }
+  .cp-hl { outline: 3px solid #f97316; transform: translate(-50%, -110%) scale(1.15); }
   .cp-dest {
     transform: translate(-50%, -110%);
     background: #dc2626; color: #fff; font-weight: 800;
     padding: 6px 12px; border-radius: 12px; white-space: nowrap;
     box-shadow: 0 2px 8px rgba(0,0,0,.35); font-size: 14px;
   }
+
+  /* Dark mode overrides (toggled by html.dark) */
+  html.dark body, html.dark .bg-slate-100 { background-color: #0f172a !important; }
+  html.dark .bg-white { background-color: #1e293b !important; }
+  html.dark .rounded-full.bg-slate-100 { background-color: #334155 !important; }
+  html.dark .bg-emerald-100 { background-color: #064e3b !important; }
+  html.dark .bg-red-100 { background-color: #7f1d1d !important; }
+  html.dark .bg-blue-50 { background-color: #1e3a8a !important; }
+  html.dark .text-slate-900, html.dark .text-slate-800, html.dark .text-slate-700,
+  html.dark .text-slate-600, html.dark .text-slate-500 { color: #e2e8f0 !important; }
+  html.dark .border-slate-300, html.dark .border-slate-400 { border-color: #475569 !important; }
+  html.dark input, html.dark select { color: #f1f5f9 !important; background-color: #0f172a !important; }
+  html.dark .hover\:bg-slate-100:hover { background-color: #334155 !important; }
+  html.dark .cp-label { background: #ffffff !important; color: #000000 !important; }
 </style>
 </head>
 <body class="bg-slate-100">
@@ -48,6 +63,13 @@ function loadMine(id) {
     const m = JSON.parse(localStorage.getItem('carpool_mine_' + id));
     return { cars: m?.cars || [], joins: m?.joins || [] };
   } catch { return { cars: [], joins: [] }; }
+}
+
+// Convert ISO string to value usable by datetime-local input
+function toLocalInput(iso) {
+  const d = new Date(iso);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
 async function geocode(q, signal) {
@@ -84,13 +106,28 @@ function isValidAction(a) {
 ------------------------------------------------------------------- */
 function reduce(actions) {
   let event = null;
+  let deleted = false;
   const cars = new Map();
   for (const a of actions) {
     switch (a.type) {
       case 'create':
-        if (!event && a.dest && Number.isFinite(a.dest.lat)) {
+        if (!event && !deleted && a.dest && Number.isFinite(a.dest.lat)) {
           event = { name: a.name, dest: a.dest, when: a.when };
         }
+        break;
+      case 'editEvent':
+        if (event && !deleted) {
+          event = {
+            ...event,
+            ...(a.name ? { name: a.name } : {}),
+            ...(a.dest && Number.isFinite(a.dest.lat) ? { dest: a.dest } : {}),
+            ...(a.when ? { when: a.when } : {})
+          };
+        }
+        break;
+      case 'deleteEvent':
+        deleted = true;
+        event = null;
         break;
       case 'addCar': {
         if (cars.has(a.carId)) break;
@@ -121,7 +158,7 @@ function reduce(actions) {
         break;
     }
   }
-  return { event, cars: [...cars.values()] };
+  return { event, deleted, cars: [...cars.values()] };
 }
 
 /* ------------------------------------------------------------------
@@ -243,9 +280,26 @@ function AddressInput({ value, onText, onPick, placeholder }) {
 }
 
 /* ------------------------------------------------------------------
+   Theme toggle (☀️ / 🌙)
+------------------------------------------------------------------- */
+function ThemeToggle({ theme, setTheme, className = '' }) {
+  const isDark = theme === 'dark';
+  return (
+    <button
+      type="button"
+      onClick={() => setTheme(isDark ? 'light' : 'dark')}
+      title={isDark ? 'Switch to light mode' : 'Switch to dark mode'}
+      className={`rounded-full bg-slate-100 px-3 py-2 text-xl shadow hover:opacity-80 ${className}`}
+    >
+      {isDark ? '☀️' : '🌙'}
+    </button>
+  );
+}
+
+/* ------------------------------------------------------------------
    Home: create event
 ------------------------------------------------------------------- */
-function Home({ onCreated }) {
+function Home({ onCreated, theme, setTheme }) {
   const [name, setName] = useState('');
   const [destText, setDestText] = useState('');
   const [dest, setDest] = useState(null);
@@ -284,10 +338,11 @@ function Home({ onCreated }) {
   }
 
   return (
-    <div className="min-h-screen flex items-center justify-center p-4 bg-gradient-to-br from-blue-600 to-emerald-500">
+    <div className="relative min-h-screen flex items-center justify-center p-4 bg-gradient-to-br from-blue-600 to-emerald-500">
+      <ThemeToggle theme={theme} setTheme={setTheme} className="absolute right-4 top-4" />
       <form onSubmit={submit} className="w-full max-w-lg rounded-3xl bg-white p-8 shadow-2xl space-y-5">
         <div>
-          <h1 className="text-4xl font-black">🚗 Carpool Map</h1>
+          <h1 className="text-4xl font-black">🦁 Carpool Map</h1>
           <p className="mt-2 text-slate-600 text-lg">Create a match event, then share the link so everyone can add cars and seats.</p>
         </div>
         <div>
@@ -354,7 +409,7 @@ function RoomMap({ dest, cars, highlight, onPick }) {
       const marker = window.L.marker([car.addr.lat, car.addr.lng], {
         icon: window.L.divIcon({
           className: 'cp-pin',
-          html: `<div class="cp-label ${hl ? 'cp-hl' : ''}">🚗 ${esc(car.driver)}</div>`,
+          html: `<div class="cp-label ${hl ? 'cp-hl' : ''}">🦁 ${esc(car.driver)}</div>`,
           iconSize: [0, 0], iconAnchor: [0, 0]
         })
       });
@@ -480,11 +535,81 @@ function AddCarForm({ onAdd }) {
 }
 
 /* ------------------------------------------------------------------
+   Edit / Delete event section
+------------------------------------------------------------------- */
+function EventEditor({ event, onSave, onDelete }) {
+  const [name, setName] = useState(event.name);
+  const [destText, setDestText] = useState(event.dest.label);
+  const [dest, setDest] = useState(null);
+  const [when, setWhen] = useState(toLocalInput(event.when));
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const [saved, setSaved] = useState(false);
+
+  async function save(e) {
+    e.preventDefault();
+    if (!name.trim() || !when || !destText.trim()) {
+      setErr('Match name, destination and time are required.');
+      return;
+    }
+    setBusy(true); setErr('');
+    try {
+      let d = dest;
+      if (!d && destText.trim() !== event.dest.label) {
+        const r = await geocode(destText);
+        if (!r.length) throw new Error('Destination not found. Try a more specific address.');
+        d = r[0];
+      }
+      const changes = {
+        name: name.trim().slice(0, 80),
+        when: new Date(when).toISOString()
+      };
+      if (d) changes.dest = { lat: d.lat, lng: d.lng, label: d.label };
+      await onSave(changes);
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2000);
+    } catch (ex) {
+      setErr(ex.message || 'Could not save changes.');
+    }
+    setBusy(false);
+  }
+
+  return (
+    <form onSubmit={save} className="space-y-4 rounded-3xl bg-white p-6 shadow-lg">
+      <h2 className="text-2xl font-black">✏️ Edit Event</h2>
+      <div>
+        <label className="mb-1 block font-bold">Match name</label>
+        <input className={inp} value={name} onChange={e => setName(e.target.value)} />
+      </div>
+      <div>
+        <label className="mb-1 block font-bold">Destination</label>
+        <AddressInput value={destText} onText={setDestText} onPick={setDest} placeholder="Stadium or venue address" />
+      </div>
+      <div>
+        <label className="mb-1 block font-bold">Date and time</label>
+        <input type="datetime-local" className={inp} value={when} onChange={e => setWhen(e.target.value)} />
+      </div>
+      {err && <p className="rounded-xl bg-red-100 p-3 font-semibold text-red-700">{err}</p>}
+      <div className="flex flex-col gap-3">
+        <button type="submit" disabled={busy} className={btn + " w-full"}>
+          {busy ? 'Saving…' : saved ? 'Saved!' : 'Save Changes'}
+        </button>
+        <button
+          type="button"
+          onClick={onDelete}
+          className="w-full rounded-xl bg-red-600 px-5 py-3 text-lg font-bold text-white shadow hover:bg-red-700"
+        >Delete Event</button>
+      </div>
+    </form>
+  );
+}
+
+/* ------------------------------------------------------------------
    Room: live event page
 ------------------------------------------------------------------- */
-function Room({ eventId }) {
+function Room({ eventId, theme, setTheme }) {
   const { actions, status, send } = useRoom(eventId);
-  const { event, cars } = useMemo(() => reduce(actions), [actions]);
+  const { event, deleted, cars } = useMemo(() => reduce(actions), [actions]);
   const [mine, setMine] = useState(() => loadMine(eventId));
   const [highlight, setHighlight] = useState(null);
   const [copied, setCopied] = useState(false);
@@ -538,6 +663,13 @@ function Room({ eventId }) {
     updateMine({ ...mine, cars: mine.cars.filter(c => c !== car.id) });
   };
 
+  const saveEvent = (changes) => send({ id: uid(), t: Date.now(), type: 'editEvent', ...changes });
+
+  const deleteEvent = () => {
+    if (!window.confirm('Delete this event for everyone? This cannot be undone.')) return;
+    send({ id: uid(), t: Date.now(), type: 'deleteEvent' });
+  };
+
   const pill = {
     live: ['bg-emerald-500', 'Live'],
     connecting: ['bg-amber-400', 'Connecting…'],
@@ -554,7 +686,7 @@ function Room({ eventId }) {
         <div className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-3 px-4 py-4">
           <div className="min-w-0">
             <h1 className="truncate text-2xl font-extrabold sm:text-3xl">
-              {event ? event.name : 'Loading match…'}
+              🦁 {event ? event.name : deleted ? 'Event deleted' : 'Loading match…'}
             </h1>
             {event && (
               <p className="text-slate-600">
@@ -566,13 +698,20 @@ function Room({ eventId }) {
             <span className="flex items-center gap-2 rounded-full bg-slate-100 px-3 py-1 text-sm font-semibold">
               <span className={`inline-block h-3 w-3 rounded-full ${pill[0]}`}></span>{pill[1]}
             </span>
-            <button onClick={copy} className={btn}>{copied ? 'Copied!' : 'Copy Link'}</button>
+            <ThemeToggle theme={theme} setTheme={setTheme} />
+            {!deleted && <button onClick={copy} className={btn}>{copied ? 'Copied!' : 'Copy Link'}</button>}
           </div>
         </div>
       </header>
 
       <main className="mx-auto max-w-6xl space-y-6 p-4">
-        {event ? (
+        {deleted ? (
+          <div className="rounded-3xl bg-white p-10 text-center shadow-lg">
+            <p className="text-3xl font-black">This event was deleted.</p>
+            <p className="mt-2 text-lg text-slate-500">Create a new match from the home page.</p>
+            <a href={window.location.pathname} className={btn + " mt-6 inline-block no-underline"}>Create new event</a>
+          </div>
+        ) : event ? (
           <RoomMap dest={event.dest} cars={cars} highlight={highlight} onPick={pickOnMap} />
         ) : (
           <div className="flex h-[200px] items-center justify-center rounded-2xl bg-white text-lg text-slate-500 shadow">
@@ -580,40 +719,51 @@ function Room({ eventId }) {
           </div>
         )}
 
-        <div className="grid gap-6 lg:grid-cols-3">
-          <section className="space-y-6 lg:col-span-2">
-            {cars.length === 0 && (
-              <div className="rounded-3xl bg-white p-8 text-center text-lg text-slate-500 shadow">
-                No cars yet. Add the first one!
-              </div>
-            )}
-            {cars.map(car => (
-              <CarCard
-                key={car.id}
-                car={car}
-                highlighted={highlight === car.id}
-                isMine={mine.cars.includes(car.id)}
-                myJoins={mine.joins}
-                onJoin={join}
-                onLeave={leave}
-                onRemove={removeCar}
-              />
-            ))}
-          </section>
-          <aside className="lg:col-span-1">
-            <AddCarForm onAdd={addCar} />
-          </aside>
-        </div>
+        {!deleted && (
+          <div className="grid gap-6 lg:grid-cols-3">
+            <section className="space-y-6 lg:col-span-2">
+              {cars.length === 0 && (
+                <div className="rounded-3xl bg-white p-8 text-center text-lg text-slate-500 shadow">
+                  No cars yet. Add the first one!
+                </div>
+              )}
+              {cars.map(car => (
+                <CarCard
+                  key={car.id}
+                  car={car}
+                  highlighted={highlight === car.id}
+                  isMine={mine.cars.includes(car.id)}
+                  myJoins={mine.joins}
+                  onJoin={join}
+                  onLeave={leave}
+                  onRemove={removeCar}
+                />
+              ))}
+            </section>
+            <aside className="space-y-6 lg:col-span-1">
+              <AddCarForm onAdd={addCar} />
+              {event && <EventEditor key={eventId} event={event} onSave={saveEvent} onDelete={deleteEvent} />}
+            </aside>
+          </div>
+        )}
       </main>
     </div>
   );
 }
 
 /* ------------------------------------------------------------------
-   App: routing by ?event=<id>
+   App: routing by ?event=<id>, theme persisted in localStorage
 ------------------------------------------------------------------- */
 function App() {
   const [eventId, setEventId] = useState(() => new URLSearchParams(window.location.search).get('event'));
+  const [theme, setTheme] = useState(() => {
+    try { return localStorage.getItem('carpool_theme') === 'dark' ? 'dark' : 'light'; } catch { return 'light'; }
+  });
+
+  useEffect(() => {
+    document.documentElement.classList.toggle('dark', theme === 'dark');
+    try { localStorage.setItem('carpool_theme', theme); } catch {}
+  }, [theme]);
 
   useEffect(() => {
     const onPop = () => setEventId(new URLSearchParams(window.location.search).get('event'));
@@ -621,12 +771,16 @@ function App() {
     return () => window.removeEventListener('popstate', onPop);
   }, []);
 
-  if (eventId) return <Room key={eventId} eventId={eventId} />;
+  if (eventId) return <Room key={eventId} eventId={eventId} theme={theme} setTheme={setTheme} />;
   return (
-    <Home onCreated={(id) => {
-      window.history.pushState({}, '', `?event=${id}`);
-      setEventId(id);
-    }} />
+    <Home
+      theme={theme}
+      setTheme={setTheme}
+      onCreated={(id) => {
+        window.history.pushState({}, '', `?event=${id}`);
+        setEventId(id);
+      }}
+    />
   );
 }
 
