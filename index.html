@@ -48,6 +48,10 @@
 <script type="text/babel" data-presets="react">
 const { useState, useEffect, useRef, useMemo } = React;
 
+// Optional: paste a Google Maps JavaScript API key here to use Google Places Autocomplete.
+// Leave empty to use the free Photon search.
+const GOOGLE_MAPS_API_KEY = '';
+
 /* ------------------------------------------------------------------
    Helpers
 ------------------------------------------------------------------- */
@@ -72,39 +76,76 @@ function toLocalInput(iso) {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
-async function geocode(q, signal) {
-  // Normalise "Padre Piquer, 50" -> "Padre Piquer 50"
-  const norm = q.trim().replace(/\s*,\s*(\d+[A-Za-z]?)\b/g, ' $1');
-  const base = 'format=json&limit=8&addressdetails=1&countrycodes=es';
-  const hit = (u) => fetch(u, { signal })
-    .then(r => (r.ok ? r.json() : []))
-    .catch(() => []);
+// Pasted Google Maps link: pull coordinates from "@lat,lng" or "!3d lat!4d lng".
+function parseMapsUrl(text) {
+  const t = text.trim();
+  if (!/google/i.test(t)) return null;
+  const m = t.match(/@(-?\d+\.\d+),(-?\d+\.\d+)/) || t.match(/!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)/);
+  if (!m) return null;
+  const place = (t.match(/\/place\/([^/@?]+)/) || [])[1];
+  const label = place ? decodeURIComponent(place.replace(/\+/g, ' ')) : `${m[1]}, ${m[2]}`;
+  return [{ lat: +m[1], lng: +m[2], label }];
+}
 
-  const queries = [
-    hit(`https://nominatim.openstreetmap.org/search?${base}&q=${encodeURIComponent(norm)}`)
-  ];
-
-  // Structured search: house number + street name, e.g. "50 Padre Piquer"
-  const m = norm.match(/^(.+?)\s+(\d+[A-Za-z]?)$/) || norm.match(/^(\d+[A-Za-z]?)\s+(.+)$/);
-  if (m) {
-    const street = /^\d/.test(m[1]) ? `${m[1]} ${m[2]}` : `${m[2]} ${m[1]}`;
-    queries.push(hit(`https://nominatim.openstreetmap.org/search?${base}&street=${encodeURIComponent(street)}`));
-  }
-
-  if (signal?.aborted) throw new Error('aborted');
-  const lists = await Promise.all(queries);
-
-  // Merge and de-duplicate; results that carry a house number come first.
-  const seen = new Set();
-  const all = [];
-  lists.flat().forEach(x => {
-    const key = `${(+x.lat).toFixed(5)},${(+x.lon).toFixed(5)}`;
-    if (seen.has(key)) return;
-    seen.add(key);
-    all.push({ lat: +x.lat, lng: +x.lon, label: x.display_name, num: !!x.address?.house_number });
+// Photon (default, free, no key). Returns GeoJSON features as {lat, lng, label}.
+async function photonSearch(q, signal) {
+  const r = await fetch(`https://photon.komoot.io/api/?q=${encodeURIComponent(q)}&limit=5`, { signal });
+  if (!r.ok) throw new Error('Address lookup failed. Check your connection.');
+  const j = await r.json();
+  return (j.features || []).map(f => {
+    const p = f.properties || {};
+    const [lng, lat] = f.geometry.coordinates;
+    const head = p.street && p.housenumber ? `${p.street} ${p.housenumber}` : (p.name || p.street || '');
+    const label = [head, p.city || p.town || p.village || p.county, p.country]
+      .filter(Boolean)
+      .filter((v, i, a) => a.indexOf(v) === i)
+      .join(', ');
+    return { lat, lng, label: label || `${lat.toFixed(5)}, ${lng.toFixed(5)}` };
   });
-  all.sort((a, b) => (b.num ? 1 : 0) - (a.num ? 1 : 0));
-  return all.slice(0, 6).map(({ lat, lng, label }) => ({ lat, lng, label }));
+}
+
+// Optional Google Places (used only when GOOGLE_MAPS_API_KEY is set).
+let gmapsPromise = null;
+function loadGoogle() {
+  if (window.google?.maps?.places) return Promise.resolve(window.google);
+  if (!gmapsPromise) {
+    gmapsPromise = new Promise((res, rej) => {
+      window.__cpGmapsReady = () => res(window.google);
+      const s = document.createElement('script');
+      s.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(GOOGLE_MAPS_API_KEY)}&libraries=places&callback=__cpGmapsReady`;
+      s.onerror = () => { gmapsPromise = null; rej(new Error('Google Maps failed to load')); };
+      document.head.appendChild(s);
+    });
+  }
+  return gmapsPromise;
+}
+
+async function googleSearch(q) {
+  const g = await loadGoogle();
+  const svc = new g.maps.places.AutocompleteService();
+  const preds = await new Promise(res =>
+    svc.getPlacePredictions({ input: q }, p => res(p || [])));
+  const geocoder = new g.maps.Geocoder();
+  const resolved = await Promise.all(preds.slice(0, 5).map(p => new Promise(res =>
+    geocoder.geocode({ placeId: p.place_id }, (results, status) => {
+      if (status === 'OK' && results[0]) {
+        res({ lat: results[0].geometry.location.lat(), lng: results[0].geometry.location.lng(), label: p.description });
+      } else res(null);
+    }))));
+  return resolved.filter(Boolean);
+}
+
+// Single entry point used everywhere: returns [{lat, lng, label}, ...]
+async function geocode(q, signal) {
+  const pasted = parseMapsUrl(q);
+  if (pasted) return pasted;
+  if (GOOGLE_MAPS_API_KEY) {
+    try {
+      const g = await googleSearch(q);
+      if (g.length) return g;
+    } catch {}
+  }
+  return photonSearch(q, signal);
 }
 
 // Publish an action to the event's ntfy topic. Plain-text body = simple CORS request.
@@ -176,7 +217,7 @@ function reduce(actions) {
       }
       case 'leave': {
         const c = cars.get(a.carId);
-        if (c && c.seats[a.seatIdx] && c.seats[a.seatIdx].id === a.joinId) {
+        if (c && c.seats[a.seatIdx]) {
           c.seats[a.seatIdx] = null;
         }
         break;
@@ -184,6 +225,18 @@ function reduce(actions) {
       case 'deleteCar':
         cars.delete(a.carId);
         break;
+      case 'editCar': {
+        const c = cars.get(a.carId);
+        if (!c) break;
+        const requested = Math.min(7, Math.max(1, parseInt(a.seats, 10) || c.seats.length));
+        let last = -1;
+        c.seats.forEach((s, i) => { if (s) last = i; });
+        const n = Math.max(requested, last + 1);
+        c.seats = Array.from({ length: n }, (_, i) => c.seats[i] || null);
+        if (a.driver) c.driver = a.driver;
+        if (a.addr && Number.isFinite(a.addr.lat)) c.addr = a.addr;
+        break;
+      }
     }
   }
   return { event, deleted, cars: [...cars.values()] };
@@ -267,14 +320,43 @@ function useRoom(eventId) {
    Address autocomplete (Nominatim)
 ------------------------------------------------------------------- */
 function AddressInput({ value, onText, onPick, placeholder }) {
-  // Plain text entry. The address is looked up when the form is submitted.
+  const [items, setItems] = useState([]);
+  const [open, setOpen] = useState(false);
+
+  useEffect(() => {
+    if (!open || value.trim().length < 3) { setItems([]); return; }
+    const ac = new AbortController();
+    const t = setTimeout(async () => {
+      try { setItems(await geocode(value, ac.signal)); } catch {}
+    }, 350);
+    return () => { clearTimeout(t); ac.abort(); };
+  }, [value, open]);
+
   return (
-    <input
-      className={inp}
-      value={value}
-      placeholder={placeholder}
-      onChange={e => { onText(e.target.value); onPick(null); }}
-    />
+    <div className="relative">
+      <input
+        className={inp}
+        value={value}
+        placeholder={placeholder}
+        onChange={e => { onText(e.target.value); onPick(null); setOpen(true); }}
+        onFocus={() => setOpen(true)}
+        onBlur={() => setTimeout(() => setOpen(false), 150)}
+      />
+      {open && items.length > 0 && (
+        <ul className="absolute z-[1000] mt-1 w-full overflow-hidden rounded-xl border bg-white shadow-xl">
+          {items.map((it, i) => (
+            <li key={i}>
+              <button
+                type="button"
+                className="w-full px-3 py-2 text-left text-sm hover:bg-slate-100"
+                onMouseDown={e => e.preventDefault()}
+                onClick={() => { onPick(it); onText(it.label); setOpen(false); }}
+              >{it.label}</button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
   );
 }
 
@@ -433,8 +515,35 @@ function RoomMap({ dest, cars, highlight, onPick }) {
 /* ------------------------------------------------------------------
    Car card
 ------------------------------------------------------------------- */
-function CarCard({ car, highlighted, isMine, myJoins, onJoin, onLeave, onRemove }) {
+function CarCard({ car, highlighted, onJoin, onLeave, onRemove, onEdit }) {
   const free = car.seats.filter(s => !s).length;
+  const [editing, setEditing] = useState(false);
+  const [driver, setDriver] = useState(car.driver);
+  const [addrText, setAddrText] = useState(car.addr.label);
+  const [addr, setAddr] = useState(null);
+  const [seats, setSeats] = useState(car.seats.length);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+
+  async function saveEdit(e) {
+    e.preventDefault();
+    if (!driver.trim() || !addrText.trim()) { setErr('Driver name and address are required.'); return; }
+    setBusy(true); setErr('');
+    try {
+      let a = addr;
+      if (!a || a.label !== addrText) {
+        const r = await geocode(addrText);
+        if (!r.length) throw new Error('Address not found. Try a more specific address.');
+        a = r[0];
+      }
+      await onEdit(car, { driver: driver.trim().slice(0, 40), addr: { lat: a.lat, lng: a.lng, label: a.label }, seats });
+      setEditing(false);
+    } catch (ex) {
+      setErr(ex.message || 'Could not save changes.');
+    }
+    setBusy(false);
+  }
+
   return (
     <div
       id={`car-${car.id}`}
@@ -445,10 +554,22 @@ function CarCard({ car, highlighted, isMine, myJoins, onJoin, onLeave, onRemove 
           <p className="text-sm font-bold uppercase tracking-wide text-slate-500">Driver</p>
           <h3 className="text-3xl font-black break-words">🚗 {car.driver}</h3>
         </div>
-        {isMine && (
-          <button onClick={() => onRemove(car)} className="shrink-0 text-sm font-semibold text-red-600 underline">Remove car</button>
-        )}
+        <div className="flex shrink-0 gap-3">
+          <button type="button" onClick={() => setEditing(!editing)} className="text-sm font-semibold text-blue-600 underline">{editing ? 'Cancel' : 'Edit car'}</button>
+          <button type="button" onClick={() => onRemove(car)} className="text-sm font-semibold text-red-600 underline">Remove car</button>
+        </div>
       </div>
+      {editing && (
+        <form onSubmit={saveEdit} className="mt-4 space-y-3 rounded-2xl bg-slate-50 p-4">
+          <input className={inp} value={driver} onChange={e => setDriver(e.target.value)} placeholder="Driver name" />
+          <AddressInput value={addrText} onText={setAddrText} onPick={setAddr} placeholder="Departure address" />
+          <select className={inp} value={seats} onChange={e => setSeats(+e.target.value)}>
+            {[1, 2, 3, 4, 5, 6, 7].map(n => <option key={n} value={n}>{n} seat{n > 1 ? 's' : ''}</option>)}
+          </select>
+          {err && <p className="rounded-xl bg-red-100 p-3 font-semibold text-red-700">{err}</p>}
+          <button type="submit" disabled={busy} className={btn + " w-full"}>{busy ? 'Saving…' : 'Save car'}</button>
+        </form>
+      )}
       <p className="mt-3 text-base text-slate-700 break-words">📍 {car.addr.label}</p>
       <p className={`mt-4 text-lg font-extrabold ${free ? 'text-emerald-700' : 'text-red-600'}`}>
         {free ? `${free} seat${free > 1 ? 's' : ''} free` : 'Full'}
@@ -460,9 +581,7 @@ function CarCard({ car, highlighted, isMine, myJoins, onJoin, onLeave, onRemove 
         {car.seats.map((s, i) => s ? (
           <div key={i} className="flex items-center justify-between gap-2 rounded-2xl border-2 border-emerald-500 bg-emerald-100 p-4">
             <span className="truncate text-lg font-bold">👤 {s.name}</span>
-            {myJoins.includes(s.id) && (
-              <button onClick={() => onLeave(car, i)} className="shrink-0 rounded-lg bg-white px-2 py-1 text-sm font-bold text-red-600 shadow">Leave</button>
-            )}
+            <button type="button" onClick={() => onLeave(car, i)} className="shrink-0 rounded-lg bg-white px-2 py-1 text-sm font-bold text-red-600 shadow">Remove</button>
           </div>
         ) : (
           <button
@@ -663,6 +782,8 @@ function Room({ eventId, theme, setTheme }) {
     updateMine({ ...mine, cars: mine.cars.filter(c => c !== car.id) });
   };
 
+  const editCar = (car, changes) => send({ id: uid(), t: Date.now(), type: 'editCar', carId: car.id, ...changes });
+
   const saveEvent = (changes) => {
     indexPublish(eventId, { name: changes.name, when: changes.when, dest: changes.dest || event.dest, deleted: false });
     return send({ id: uid(), t: Date.now(), type: 'editEvent', ...changes });
@@ -736,11 +857,10 @@ function Room({ eventId, theme, setTheme }) {
                   key={car.id}
                   car={car}
                   highlighted={highlight === car.id}
-                  isMine={mine.cars.includes(car.id)}
-                  myJoins={mine.joins}
                   onJoin={join}
                   onLeave={leave}
                   onRemove={removeCar}
+                  onEdit={editCar}
                 />
               ))}
             </section>
