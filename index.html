@@ -73,10 +73,38 @@ function toLocalInput(iso) {
 }
 
 async function geocode(q, signal) {
-  const r = await fetch(`https://nominatim.openstreetmap.org/search?format=json&limit=5&q=${encodeURIComponent(q)}`, { signal });
-  if (!r.ok) throw new Error('Address lookup failed. Check your connection.');
-  const j = await r.json();
-  return j.map(x => ({ lat: +x.lat, lng: +x.lon, label: x.display_name }));
+  // Normalise "Padre Piquer, 50" -> "Padre Piquer 50"
+  const norm = q.trim().replace(/\s*,\s*(\d+[A-Za-z]?)\b/g, ' $1');
+  const base = 'format=json&limit=8&addressdetails=1&countrycodes=es';
+  const hit = (u) => fetch(u, { signal })
+    .then(r => (r.ok ? r.json() : []))
+    .catch(() => []);
+
+  const queries = [
+    hit(`https://nominatim.openstreetmap.org/search?${base}&q=${encodeURIComponent(norm)}`)
+  ];
+
+  // Structured search: house number + street name, e.g. "50 Padre Piquer"
+  const m = norm.match(/^(.+?)\s+(\d+[A-Za-z]?)$/) || norm.match(/^(\d+[A-Za-z]?)\s+(.+)$/);
+  if (m) {
+    const street = /^\d/.test(m[1]) ? `${m[1]} ${m[2]}` : `${m[2]} ${m[1]}`;
+    queries.push(hit(`https://nominatim.openstreetmap.org/search?${base}&street=${encodeURIComponent(street)}`));
+  }
+
+  if (signal?.aborted) throw new Error('aborted');
+  const lists = await Promise.all(queries);
+
+  // Merge and de-duplicate; results that carry a house number come first.
+  const seen = new Set();
+  const all = [];
+  lists.flat().forEach(x => {
+    const key = `${(+x.lat).toFixed(5)},${(+x.lon).toFixed(5)}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    all.push({ lat: +x.lat, lng: +x.lon, label: x.display_name, num: !!x.address?.house_number });
+  });
+  all.sort((a, b) => (b.num ? 1 : 0) - (a.num ? 1 : 0));
+  return all.slice(0, 6).map(({ lat, lng, label }) => ({ lat, lng, label }));
 }
 
 // Publish an action to the event's ntfy topic. Plain-text body = simple CORS request.
