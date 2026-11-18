@@ -267,43 +267,14 @@ function useRoom(eventId) {
    Address autocomplete (Nominatim)
 ------------------------------------------------------------------- */
 function AddressInput({ value, onText, onPick, placeholder }) {
-  const [items, setItems] = useState([]);
-  const [open, setOpen] = useState(false);
-
-  useEffect(() => {
-    if (!open || value.trim().length < 3) { setItems([]); return; }
-    const ac = new AbortController();
-    const t = setTimeout(async () => {
-      try { setItems(await geocode(value, ac.signal)); } catch {}
-    }, 400);
-    return () => { clearTimeout(t); ac.abort(); };
-  }, [value, open]);
-
+  // Plain text entry. The address is looked up when the form is submitted.
   return (
-    <div className="relative">
-      <input
-        className={inp}
-        value={value}
-        placeholder={placeholder}
-        onChange={e => { onText(e.target.value); onPick(null); setOpen(true); }}
-        onFocus={() => setOpen(true)}
-        onBlur={() => setTimeout(() => setOpen(false), 150)}
-      />
-      {open && items.length > 0 && (
-        <ul className="absolute z-[1000] mt-1 w-full overflow-hidden rounded-xl border bg-white shadow-xl">
-          {items.map((it, i) => (
-            <li key={i}>
-              <button
-                type="button"
-                className="w-full px-3 py-2 text-left text-sm hover:bg-slate-100"
-                onMouseDown={e => e.preventDefault()}
-                onClick={() => { onPick(it); onText(it.label); setOpen(false); }}
-              >{it.label}</button>
-            </li>
-          ))}
-        </ul>
-      )}
-    </div>
+    <input
+      className={inp}
+      value={value}
+      placeholder={placeholder}
+      onChange={e => { onText(e.target.value); onPick(null); }}
+    />
   );
 }
 
@@ -358,6 +329,7 @@ function Home({ onCreated, theme, setTheme }) {
       };
       try { localStorage.setItem(`carpool_cache_${id}`, JSON.stringify([action])); } catch {}
       await publish(TOPIC(id), action);
+      indexPublish(id, { name: action.name, when: action.when, dest: action.dest, deleted: false });
       onCreated(id);
     } catch (ex) {
       setErr(ex.message || 'Could not create event.');
@@ -691,10 +663,14 @@ function Room({ eventId, theme, setTheme }) {
     updateMine({ ...mine, cars: mine.cars.filter(c => c !== car.id) });
   };
 
-  const saveEvent = (changes) => send({ id: uid(), t: Date.now(), type: 'editEvent', ...changes });
+  const saveEvent = (changes) => {
+    indexPublish(eventId, { name: changes.name, when: changes.when, dest: changes.dest || event.dest, deleted: false });
+    return send({ id: uid(), t: Date.now(), type: 'editEvent', ...changes });
+  };
 
   const deleteEvent = () => {
     if (!window.confirm('Delete this event for everyone? This cannot be undone.')) return;
+    indexPublish(eventId, { name: event.name, when: event.when, dest: event.dest, deleted: true });
     send({ id: uid(), t: Date.now(), type: 'deleteEvent' });
   };
 
@@ -782,8 +758,113 @@ function Room({ eventId, theme, setTheme }) {
 /* ------------------------------------------------------------------
    App: routing by ?event=<id>, theme persisted in localStorage
 ------------------------------------------------------------------- */
+/* ------------------------------------------------------------------
+   Shared index of events (so every live event can be listed)
+------------------------------------------------------------------- */
+const INDEX_TOPIC = 'carpool_v1_index';
+
+function indexPublish(eventId, data) {
+  return publish(INDEX_TOPIC, { id: uid(), t: Date.now(), type: 'indexEvent', eventId, ...data });
+}
+
+function sendEventAction(eventId, action) {
+  return publish(TOPIC(eventId), { id: uid(), t: Date.now(), ...action });
+}
+
+// Subscribes to the index topic. Keeps the latest record per event.
+function useIndex() {
+  const [items, setItems] = useState(new Map());
+  useEffect(() => {
+    let cancelled = false;
+    let es = null;
+    const seen = new Map();
+    const apply = (a) => {
+      if (!a || a.type !== 'indexEvent') return;
+      const prev = seen.get(a.eventId);
+      if (!prev || a.t >= prev.t) seen.set(a.eventId, a);
+    };
+    const flush = () => { if (!cancelled) setItems(new Map(seen)); };
+
+    (async () => {
+      try {
+        const r = await fetch(`https://ntfy.sh/${INDEX_TOPIC}/json?poll=1&since=all`);
+        const text = await r.text();
+        text.split('\n').forEach(line => apply(parseNtfy(line)));
+        flush();
+      } catch {}
+      if (cancelled) return;
+      es = new EventSource(`https://ntfy.sh/${INDEX_TOPIC}/sse?since=${Math.floor(Date.now() / 1000) - 2}`);
+      es.onmessage = (e) => { const a = parseNtfy(e.data); if (a) { apply(a); flush(); } };
+    })();
+
+    return () => { cancelled = true; if (es) es.close(); };
+  }, []);
+  return items;
+}
+
+// Live events list with inline editing and deletion.
+function EventsTab({ onOpen }) {
+  const items = useIndex();
+  const [editing, setEditing] = useState(null);
+  const live = [...items.values()]
+    .filter(r => !r.deleted)
+    .sort((a, b) => new Date(a.when) - new Date(b.when));
+
+  const saveRemote = (ev, changes) => {
+    const dest = changes.dest || ev.dest;
+    sendEventAction(ev.eventId, { type: 'editEvent', ...changes });
+    return indexPublish(ev.eventId, { name: changes.name, when: changes.when, dest, deleted: false });
+  };
+
+  const deleteRemote = (ev) => {
+    if (!window.confirm('Delete this event for everyone? This cannot be undone.')) return;
+    sendEventAction(ev.eventId, { type: 'deleteEvent' });
+    indexPublish(ev.eventId, { name: ev.name, when: ev.when, dest: ev.dest, deleted: true });
+  };
+
+  return (
+    <div className="mx-auto max-w-4xl space-y-4 p-4">
+      <h2 className="text-3xl font-black">📋 Live events</h2>
+      {live.length === 0 && (
+        <div className="rounded-3xl bg-white p-8 text-center text-lg text-slate-500 shadow">
+          No live events yet. Create one from the Create event tab.
+        </div>
+      )}
+      {live.map(ev => (
+        <div key={ev.eventId} className="space-y-3 rounded-3xl bg-white p-6 shadow-lg">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="min-w-0">
+              <p className="break-words text-2xl font-black">🦁 {ev.name}</p>
+              <p className="text-slate-600">
+                📍 {ev.dest.label.split(',').slice(0, 2).join(',')} · 🕒 {new Date(ev.when).toLocaleString(undefined, {
+                  weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit'
+                })}
+              </p>
+            </div>
+            <div className="flex gap-2">
+              <button type="button" className={btn} onClick={() => onOpen(ev.eventId)}>Open</button>
+              <button type="button" className={btn} onClick={() => setEditing(editing === ev.eventId ? null : ev.eventId)}>
+                {editing === ev.eventId ? 'Close' : 'Edit'}
+              </button>
+            </div>
+          </div>
+          {editing === ev.eventId && (
+            <EventEditor
+              key={ev.eventId}
+              event={ev}
+              onSave={(changes) => saveRemote(ev, changes)}
+              onDelete={() => deleteRemote(ev)}
+            />
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function App() {
   const [eventId, setEventId] = useState(() => new URLSearchParams(window.location.search).get('event'));
+  const [tab, setTab] = useState('main');
   const [theme, setTheme] = useState(() => {
     try { return localStorage.getItem('carpool_theme') === 'dark' ? 'dark' : 'light'; } catch { return 'light'; }
   });
@@ -799,16 +880,48 @@ function App() {
     return () => window.removeEventListener('popstate', onPop);
   }, []);
 
-  if (eventId) return <Room key={eventId} eventId={eventId} theme={theme} setTheme={setTheme} />;
+  const goCreate = () => {
+    window.history.pushState({}, '', window.location.pathname);
+    setEventId(null);
+    setTab('main');
+  };
+  const openEvent = (id) => {
+    window.history.pushState({}, '', `?event=${id}`);
+    setEventId(id);
+    setTab('main');
+  };
+
+  const navBtn = "rounded-lg bg-white/10 px-4 py-2 font-bold text-white hover:bg-white/20";
+  const nav = (
+    <nav className="flex flex-wrap justify-center gap-2 bg-slate-800 p-2">
+      <button type="button" className={navBtn} onClick={goCreate}>➕ Create event</button>
+      <button type="button" className={navBtn} onClick={() => setTab('events')}>📋 Live events</button>
+    </nav>
+  );
+
+  let content;
+  if (tab === 'events') {
+    content = <EventsTab onOpen={openEvent} />;
+  } else if (eventId) {
+    content = <Room key={eventId} eventId={eventId} theme={theme} setTheme={setTheme} />;
+  } else {
+    content = (
+      <Home
+        theme={theme}
+        setTheme={setTheme}
+        onCreated={(id) => {
+          window.history.pushState({}, '', `?event=${id}`);
+          setEventId(id);
+        }}
+      />
+    );
+  }
+
   return (
-    <Home
-      theme={theme}
-      setTheme={setTheme}
-      onCreated={(id) => {
-        window.history.pushState({}, '', `?event=${id}`);
-        setEventId(id);
-      }}
-    />
+    <>
+      {nav}
+      {content}
+    </>
   );
 }
 
